@@ -239,6 +239,16 @@ enum Request {
         snapshot: Snapshot,
         reply: Sender<Result<(), Error>>,
     },
+    /// the bytes of a snapshot, through the engine of the scheduler
+    SnapshotBytes {
+        snapshot: Snapshot,
+        reply: Sender<Result<Vec<u8>, Error>>,
+    },
+    /// a snapshot from bytes, through the engine of the scheduler
+    SnapshotFromBytes {
+        bytes: Vec<u8>,
+        reply: Sender<Result<Snapshot, Error>>,
+    },
 }
 
 enum DraftMsg {
@@ -316,6 +326,20 @@ impl Engine for Handle {
 
     fn numerics(&self) -> Vec<(&'static str, String)> {
         self.info.numerics.clone()
+    }
+
+    fn snapshot_to_bytes(&self, snapshot: &Snapshot) -> Result<Vec<u8>, Error> {
+        self.call(|reply| Request::SnapshotBytes {
+            snapshot: snapshot.share(),
+            reply,
+        })
+    }
+
+    fn snapshot_from_bytes(&self, bytes: &[u8]) -> Result<Snapshot, Error> {
+        self.call(|reply| Request::SnapshotFromBytes {
+            bytes: bytes.to_vec(),
+            reply,
+        })
     }
 }
 
@@ -648,6 +672,12 @@ impl Scheduler<'_, '_> {
                 reply,
             } => {
                 let _ = reply.send(b.restore(seq, &snapshot));
+            }
+            Request::SnapshotBytes { snapshot, reply } => {
+                let _ = reply.send(self.engine.snapshot_to_bytes(&snapshot));
+            }
+            Request::SnapshotFromBytes { bytes, reply } => {
+                let _ = reply.send(self.engine.snapshot_from_bytes(&bytes));
             }
         }
     }
