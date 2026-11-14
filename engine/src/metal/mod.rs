@@ -1082,6 +1082,92 @@ impl Engine for MetalEngine<'_> {
             seqs: Vec::new(),
         })))
     }
+
+    /// The bytes of a snapshot this backend made: the f16 kv caches of its
+    /// tokens, the delta net states of its slot, the MTP head's history.
+    /// Read back only by this backend on the same model.
+    fn snapshot_to_bytes(&self, snapshot: &Snapshot) -> Result<Vec<u8>, Error> {
+        let snap: &MetalSnapshot = snapshot.data()?;
+        let n_past = snapshot.n_past();
+        let mut v = Vec::new();
+        v.extend_from_slice(b"BIVSNP1");
+        v.extend_from_slice(&(n_past as u64).to_le_bytes());
+        v.extend_from_slice(&(snapshot.bytes() as u64).to_le_bytes());
+        v.extend_from_slice(&(snap.layers.len() as u32).to_le_bytes());
+        for ls in &snap.layers {
+            match ls {
+                LayerSnapshot::Attention { k, v: kv } => {
+                    v.push(0);
+                    v.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                    v.extend_from_slice(k);
+                    v.extend_from_slice(&(kv.len() as u64).to_le_bytes());
+                    v.extend_from_slice(kv);
+                }
+                LayerSnapshot::DeltaNet { conv, s } => {
+                    v.push(1);
+                    v.extend_from_slice(&(conv.len() as u64).to_le_bytes());
+                    v.extend_from_slice(conv);
+                    v.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                    v.extend_from_slice(s);
+                }
+            }
+        }
+        match &snap.mtp {
+            None => v.push(0),
+            Some(mtp) => {
+                v.push(1);
+                v.extend_from_slice(&(mtp.k.len() as u64).to_le_bytes());
+                v.extend_from_slice(&mtp.k);
+                v.extend_from_slice(&(mtp.v.len() as u64).to_le_bytes());
+                v.extend_from_slice(&mtp.v);
+                v.extend_from_slice(&(mtp.rows as u32).to_le_bytes());
+                v.extend_from_slice(&(mtp.last.len() as u64).to_le_bytes());
+                v.extend_from_slice(&mtp.last);
+            }
+        }
+        Ok(v)
+    }
+
+    /// A snapshot from bytes this backend wrote, on the same model
+    fn snapshot_from_bytes(&self, bytes: &[u8]) -> Result<Snapshot, Error> {
+        let mut r = Read::new(bytes);
+        r.magic(b"BIVSNP1")?;
+        let n_past = r.u64()? as usize;
+        let bytes_held = r.u64()? as usize;
+        let n_layers = r.u32()? as usize;
+        let mut layers = Vec::with_capacity(n_layers.min(4096));
+        for _ in 0..n_layers {
+            layers.push(match r.u8()? {
+                0 => LayerSnapshot::Attention {
+                    k: r.bytes()?,
+                    v: r.bytes()?,
+                },
+                1 => LayerSnapshot::DeltaNet {
+                    conv: r.bytes()?,
+                    s: r.bytes()?,
+                },
+                _ => {
+                    return Err(Error::Snapshot(
+                        "the snapshot bytes hold an unknown layer kind",
+                    ))
+                }
+            });
+        }
+        let mtp = match r.u8()? {
+            0 => None,
+            1 => Some(MtpSnapshot {
+                k: r.bytes()?,
+                v: r.bytes()?,
+                rows: r.u32()? as usize,
+                last: r.bytes()?,
+            }),
+            _ => return Err(Error::Snapshot("the snapshot bytes hold a bad MTP flag")),
+        };
+        if !r.done() {
+            return Err(Error::Snapshot("the snapshot bytes end too early"));
+        }
+        Ok(Snapshot::new(n_past, bytes_held, MetalSnapshot { layers, mtp }))
+    }
 }
 
 /// `len` f32 of a shared buffer, from `offset` f32
@@ -1107,6 +1193,61 @@ fn copy_out(buf: &Buffer, offset: usize, len: usize) -> Result<Vec<u8>, Error> {
         .map_err(|_| Error::OutOfMemory { bytes: len })?;
     v.extend_from_slice(host_bytes(buf, offset, len));
     Ok(v)
+}
+
+/// A cursor over bytes, for reading a snapshot this backend wrote
+struct Read<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Read<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Read { b, i: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], Error> {
+        let end = self.i.checked_add(len).ok_or(Error::Truncated)?;
+        let s = self
+            .b
+            .get(self.i..end)
+            .ok_or(Error::Truncated)?;
+        self.i = end;
+        Ok(s)
+    }
+
+    fn magic(&mut self, m: &[u8]) -> Result<(), Error> {
+        if self.take(m.len())? == m {
+            Ok(())
+        } else {
+            Err(Error::Snapshot("the bytes are not a snapshot of this backend"))
+        }
+    }
+
+    fn u8(&mut self) -> Result<u8, Error> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, Error> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, Error> {
+        let len = self.u64()? as usize;
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn done(&self) -> bool {
+        self.i == self.b.len()
+    }
 }
 
 /// See [`Session::snapshot`]: the f16 kv caches of the tokens, the current

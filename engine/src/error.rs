@@ -64,6 +64,8 @@ pub enum Error {
     },
     /// A snapshot that can't be restored in this session
     Snapshot(&'static str),
+    /// A file the engine read or wrote for a snapshot or a prefix
+    Io(String),
     /// A sampler seed of 0: the caller names the seed
     ZeroSeed,
     /// A sampler state of 0, which the random generator never holds
@@ -149,6 +151,7 @@ impl fmt::Display for Error {
                 write!(f, "context full ({n_past} + {prompt} tokens > {context})")
             }
             Error::Snapshot(why) => write!(f, "cannot restore the snapshot: {why}"),
+            Error::Io(what) => write!(f, "file error: {what}"),
             Error::ZeroSeed => f.write_str("sampler seed 0: name a seed"),
             Error::ZeroRngState => f.write_str("sampler state 0: not a state of the generator"),
             Error::MaskAllowsNoToken => f.write_str("sampler: the token mask allows no token"),

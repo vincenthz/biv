@@ -340,6 +340,53 @@ impl Prefix {
         self.snapshot.n_past()
     }
 
+    /// Write the prefix to a file: the snapshot through the engine that
+    /// made it, the tokens it holds, and the conversation it renders. A
+    /// later run reads it back with [`Prefix::load`] and restores it into
+    /// a chat, so the tokens of the prefix are processed once, not once
+    /// per run.
+    #[cfg(feature = "std")]
+    pub fn save(&self, engine: &dyn Engine, path: &std::path::Path) -> Result<(), Error> {
+        let snap = engine.snapshot_to_bytes(&self.snapshot)?;
+        let mut v = Vec::new();
+        v.extend_from_slice(b"BIVPFX1");
+        v.extend_from_slice(&(snap.len() as u64).to_le_bytes());
+        v.extend_from_slice(&snap);
+        put_tokens(&mut v, &self.pending);
+        put_tokens(&mut v, &self.generated);
+        put_tokens(&mut v, &self.history);
+        put_conversation(&mut v, &self.conversation);
+        std::fs::write(path, v).map_err(|e| Error::Io(format!("{}: {e}", path.display())))
+    }
+
+    /// Read a prefix a earlier run wrote with [`Prefix::save`], on the
+    /// same engine. The file names no model: the caller keeps one file
+    /// per model, for the snapshot bytes are the state of the weights
+    /// that made them.
+    #[cfg(feature = "std")]
+    pub fn load(engine: &dyn Engine, path: &std::path::Path) -> Result<Prefix, Error> {
+        let bytes = std::fs::read(path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
+        let mut r = Cursor { b: &bytes, i: 0 };
+        r.magic(b"BIVPFX1")?;
+        let snap_len = r.u64()? as usize;
+        let blob = r.take(snap_len)?;
+        let snapshot = engine.snapshot_from_bytes(blob)?;
+        let pending = r.tokens()?;
+        let generated = r.tokens()?;
+        let history = r.tokens()?;
+        let conversation = r.conversation()?;
+        if !r.done() {
+            return Err(Error::Snapshot("the prefix file ends too early"));
+        }
+        Ok(Prefix {
+            snapshot,
+            pending,
+            generated,
+            history,
+            conversation,
+        })
+    }
+
     /// Memory held
     pub fn bytes(&self) -> usize {
         self.snapshot.bytes()
@@ -1413,5 +1460,180 @@ mod tests {
     fn continuation_overlapping_its_match() {
         let h = [0, 1, 0, 1, 0];
         assert_eq!(continuation(&h, 3), Some((3, vec![1, 0, 1])));
+    }
+}
+
+
+/// Write a token vector: its length, then each token
+#[cfg(feature = "std")]
+fn put_tokens(v: &mut Vec<u8>, ts: &[TokenId]) {
+    v.extend_from_slice(&(ts.len() as u64).to_le_bytes());
+    for t in ts {
+        v.extend_from_slice(&t.to_le_bytes());
+    }
+}
+
+/// Write a string: its length, then its bytes
+#[cfg(feature = "std")]
+fn put_str(v: &mut Vec<u8>, s: &str) {
+    v.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    v.extend_from_slice(s.as_bytes());
+}
+
+/// Write a conversation: its system prompt, its tools, its messages
+#[cfg(feature = "std")]
+fn put_conversation(v: &mut Vec<u8>, c: &Conversation) {
+    match &c.system {
+        None => v.push(0),
+        Some(s) => {
+            v.push(1);
+            put_str(v, s);
+        }
+    }
+    v.extend_from_slice(&(c.tools.len() as u64).to_le_bytes());
+    for t in &c.tools {
+        put_str(v, t);
+    }
+    v.extend_from_slice(&(c.messages.len() as u64).to_le_bytes());
+    for m in &c.messages {
+        match m {
+            Said::User(text) => {
+                v.push(0);
+                put_str(v, text);
+            }
+            Said::Assistant {
+                reasoning,
+                answer,
+                tool_calls,
+            } => {
+                v.push(1);
+                match reasoning {
+                    None => v.push(0),
+                    Some(r) => {
+                        v.push(1);
+                        put_str(v, r);
+                    }
+                }
+                put_str(v, answer);
+                v.extend_from_slice(&(tool_calls.len() as u64).to_le_bytes());
+                for call in tool_calls {
+                    put_str(v, &call.name);
+                    v.extend_from_slice(&(call.arguments.len() as u64).to_le_bytes());
+                    for (k, val) in &call.arguments {
+                        put_str(v, k);
+                        put_str(v, val);
+                    }
+                }
+            }
+            Said::Tool(text) => {
+                v.push(2);
+                put_str(v, text);
+            }
+        }
+    }
+}
+
+/// A cursor over the bytes of a prefix file
+#[cfg(feature = "std")]
+struct Cursor<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+#[cfg(feature = "std")]
+impl<'a> Cursor<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8], Error> {
+        let end = self.i.checked_add(len).ok_or(Error::Truncated)?;
+        let s = self.b.get(self.i..end).ok_or(Error::Truncated)?;
+        self.i = end;
+        Ok(s)
+    }
+
+    fn magic(&mut self, m: &[u8]) -> Result<(), Error> {
+        if self.take(m.len())? == m {
+            Ok(())
+        } else {
+            Err(Error::Snapshot("the file is not a prefix of this engine"))
+        }
+    }
+
+    fn u64(&mut self) -> Result<u64, Error> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    fn str(&mut self) -> Result<String, Error> {
+        let len = self.u64()? as usize;
+        let b = self.take(len)?;
+        String::from_utf8(b.to_vec()).map_err(|_| Error::Snapshot("a prefix holds bad utf-8"))
+    }
+
+    fn tokens(&mut self) -> Result<Vec<TokenId>, Error> {
+        let len = self.u64()? as usize;
+        let mut v = Vec::with_capacity(len.min(1 << 24));
+        for _ in 0..len {
+            let b = self.take(4)?;
+            v.push(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        }
+        Ok(v)
+    }
+
+    fn conversation(&mut self) -> Result<Conversation, Error> {
+        let system = match self.take(1)?[0] {
+            0 => None,
+            1 => Some(self.str()?),
+            _ => return Err(Error::Snapshot("a prefix holds a bad system flag")),
+        };
+        let n_tools = self.u64()? as usize;
+        let mut tools = Vec::with_capacity(n_tools.min(1 << 16));
+        for _ in 0..n_tools {
+            tools.push(self.str()?);
+        }
+        let n_messages = self.u64()? as usize;
+        let mut messages = Vec::with_capacity(n_messages.min(1 << 20));
+        for _ in 0..n_messages {
+            messages.push(match self.take(1)?[0] {
+                0 => Said::User(self.str()?),
+                1 => {
+                    let reasoning = match self.take(1)?[0] {
+                        0 => None,
+                        1 => Some(self.str()?),
+                        _ => return Err(Error::Snapshot("a prefix holds a bad reasoning flag")),
+                    };
+                    let answer = self.str()?;
+                    let n_calls = self.u64()? as usize;
+                    let mut tool_calls = Vec::with_capacity(n_calls.min(1 << 16));
+                    for _ in 0..n_calls {
+                        let name = self.str()?;
+                        let n_args = self.u64()? as usize;
+                        let mut arguments = Vec::with_capacity(n_args.min(1 << 16));
+                        for _ in 0..n_args {
+                            let k = self.str()?;
+                            let val = self.str()?;
+                            arguments.push((k, val));
+                        }
+                        tool_calls.push(ToolCall { name, arguments });
+                    }
+                    Said::Assistant {
+                        reasoning,
+                        answer,
+                        tool_calls,
+                    }
+                }
+                2 => Said::Tool(self.str()?),
+                _ => return Err(Error::Snapshot("a prefix holds a bad message kind")),
+            });
+        }
+        Ok(Conversation {
+            system,
+            tools,
+            messages,
+        })
+    }
+
+    fn done(&self) -> bool {
+        self.i == self.b.len()
     }
 }

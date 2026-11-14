@@ -57,6 +57,22 @@ pub trait Engine {
         let _ = (tokens, logits);
         Ok(None)
     }
+
+    /// The bytes of a snapshot this backend made, for writing and reading
+    /// across runs. The bytes carry the tokens and the layout of the
+    /// backend that made them, and only that backend reads them back.
+    fn snapshot_to_bytes(&self, snapshot: &Snapshot) -> Result<Vec<u8>, Error> {
+        let _ = snapshot;
+        Err(Error::Snapshot("this backend cannot write a snapshot to bytes"))
+    }
+
+    /// A snapshot from bytes an earlier run wrote with
+    /// [`Engine::snapshot_to_bytes`], with the tokens it held. The backend
+    /// checks its own layout.
+    fn snapshot_from_bytes(&self, bytes: &[u8]) -> Result<Snapshot, Error> {
+        let _ = bytes;
+        Err(Error::Snapshot("this backend cannot read a snapshot from bytes"))
+    }
 }
 
 /// [`Engine::new_batch`], or sequences run one after another when the
@@ -520,6 +536,14 @@ impl<T: Engine + ?Sized> Engine for &T {
         logits: usize,
     ) -> Result<Option<Box<dyn Batch + '_>>, Error> {
         (**self).new_batch(tokens, logits)
+    }
+
+    fn snapshot_to_bytes(&self, snapshot: &Snapshot) -> Result<Vec<u8>, Error> {
+        (**self).snapshot_to_bytes(snapshot)
+    }
+
+    fn snapshot_from_bytes(&self, bytes: &[u8]) -> Result<Snapshot, Error> {
+        (**self).snapshot_from_bytes(bytes)
     }
 }
 
