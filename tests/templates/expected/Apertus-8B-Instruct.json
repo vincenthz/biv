@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "Apertus-8B-Instruct.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS><|system_start|>You are a helpful assistant.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS><|system_start|>You are a helpful assistant.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>7<|assistant_end|><|user_start|>Name one more.<|user_end|><|assistant_start|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS><|system_start|>You are a helpful assistant.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>7<|assistant_end|><|user_start|>Name one more.<|user_end|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>7<|assistant_end|><|user_start|>Name one more.<|user_end|><|assistant_start|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>7<|assistant_end|><|user_start|>Name one more.<|user_end|><|assistant_start|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS><|system_start|>You are Apertus, a helpful assistant created by the SwissAI initiative.\nKnowledge cutoff: 2024-04\nCurrent date: 2026-01-05<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Name a prime number.<|user_end|><|assistant_start|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<BOS><|system_start|>You are a helpful assistant.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities:\n// Current weather in a city\ntype get_weather = (_: {\n// City name\ncity: string,\nunit?: \"celsius\" | \"fahrenheit\"\n}) => any;<|developer_end|><|user_start|>What is the weather in Paris?<|user_end|><|assistant_start|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<BOS><|system_start|>You are a helpful assistant.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities:\n// Current weather in a city\ntype get_weather = (_: {\n// City name\ncity: string,\nunit?: \"celsius\" | \"fahrenheit\"\n}) => any;<|developer_end|><|user_start|>What is the weather in Paris?<|user_end|><|assistant_start|><|tools_prefix|>[{\"get_weather\": {\"city\": \"Paris\", \"unit\": \"celsius\"}}]<|tools_suffix|>[{\"temperature\": 18, \"condition\": \"light rain\"}]<|assistant_start|>",
+   "needs_undefined": true
+  }
+ ]
+}

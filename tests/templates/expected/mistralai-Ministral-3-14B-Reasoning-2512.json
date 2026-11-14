@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "mistralai-Ministral-3-14B-Reasoning-2512.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]7<EOS>[INST]Name one more.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]7<EOS>[INST]Name one more.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]7<EOS>[INST]Name one more.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]7<EOS>[INST]Name one more.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<BOS>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS][INST]What is the weather in Paris?[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<BOS>[SYSTEM_PROMPT]You are a helpful assistant.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS][INST]What is the weather in Paris?[/INST][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", \"unit\": \"celsius\"}<EOS>[TOOL_RESULTS]{\"temperature\": 18, \"condition\": \"light rain\"}[/TOOL_RESULTS]",
+   "needs_undefined": false
+  }
+ ]
+}

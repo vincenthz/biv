@@ -39,6 +39,8 @@ pub struct Tokenizer {
     pub eos: TokenId,
     /// tokens that end a generation
     pub eog: Vec<TokenId>,
+    /// the chat template of the model file (`tokenizer.chat_template`)
+    pub chat_template: Option<String>,
 }
 
 /// One BPE merge of a left token, which [`Merges`] files it under
@@ -374,6 +376,7 @@ impl Tokenizer {
             bos: ggml.bos_token_id,
             eos,
             eog,
+            chat_template: m.tokenizer.chat_template.clone(),
         })
     }
 

@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "meetkai-functionary-medium-v3.2.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n7<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName one more.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n7<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName one more.<|eot_id|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n7<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName one more.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>all\n7<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName one more.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n} // namespace functions<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nName a prime number.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<BOS><|start_header_id|>system<|end_header_id|>\n\nYou are capable of executing available function(s) if required.\nOnly execute function(s) when absolutely necessary.\nAsk for the required input to:recipient==all\nUse JSON for function arguments.\nRespond in this format:\n>>>${recipient}\n${content}\nAvailable functions:\n// Supported function definitions that should be called when necessary.\nnamespace functions {\n\n// Current weather in a city\ntype get_weather = (_: {\n// City name.\ncity: string,\nunit?: \"celsius\" | \"fahrenheit\",\n}) => any;\n\n} // namespace functions<|eot_id|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the weather in Paris?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n>>>",
+   "needs_undefined": true
+  },
+  {
+   "case": "tool_call_and_response",
+   "failure": "TypeError",
+   "message": "can only concatenate str (not \"dict\") to str"
+  }
+ ]
+}

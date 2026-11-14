@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "fireworks-ai-llama-3-firefunction-v2.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "system_user",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "two_turns",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "reasoned_answer",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "thinking_on",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "effort_low",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "effort_medium",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "effort_xhigh",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "tools",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  },
+  {
+   "case": "tool_call_and_response",
+   "failure": "UndefinedError",
+   "message": "'functions' is undefined"
+  }
+ ]
+}

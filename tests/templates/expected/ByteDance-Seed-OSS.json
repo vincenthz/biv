@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "ByteDance-Seed-OSS.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<seed:bos>user\nName a prime number.<seed:eos>",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<seed:bos>system\nYou are a helpful assistant.<seed:eos><seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<seed:bos>system\nYou are a helpful assistant.<seed:eos><seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n7<seed:eos><seed:bos>user\nName one more.<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<seed:bos>system\nYou are a helpful assistant.<seed:eos><seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n7<seed:eos><seed:bos>user\nName one more.<seed:eos>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n<seed:think>Seven has no divisor but 1 and 7.</seed:think>\n7<seed:eos><seed:bos>user\nName one more.<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n<seed:think>Seven has no divisor but 1 and 7.</seed:think>\n7<seed:eos><seed:bos>user\nName one more.<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<seed:bos>user\nName a prime number.<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<seed:bos>system\nYou are a helpful assistant.\n\nFunction:\ndef get_weather(city: str,unit: str):\n    \"\"\"\n    Current weather in a city\n\n    Args:\n    - city (str) [必填]: City name\n    - unit (str) [选填]: \n\n    \"\"\"\n工具调用请遵循如下格式:\n<seed:tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>value_1</parameter>\n<parameter=example_parameter_2>This is the value for the second parameter\nthat can span\nmultiple lines</parameter>\n</function>\n</seed:tool_call>\n<seed:eos><seed:bos>user\nWhat is the weather in Paris?<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<seed:bos>system\nYou are a helpful assistant.\n\nFunction:\ndef get_weather(city: str,unit: str):\n    \"\"\"\n    Current weather in a city\n\n    Args:\n    - city (str) [必填]: City name\n    - unit (str) [选填]: \n\n    \"\"\"\n工具调用请遵循如下格式:\n<seed:tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>value_1</parameter>\n<parameter=example_parameter_2>This is the value for the second parameter\nthat can span\nmultiple lines</parameter>\n</function>\n</seed:tool_call>\n<seed:eos><seed:bos>user\nWhat is the weather in Paris?<seed:eos><seed:bos>assistant\n<seed:tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n<parameter=unit>celsius</parameter>\n</function>\n</seed:tool_call><seed:eos><seed:bos>tool\n{\"temperature\": 18, \"condition\": \"light rain\"}<seed:eos><seed:bos>assistant\n",
+   "needs_undefined": true
+  }
+ ]
+}

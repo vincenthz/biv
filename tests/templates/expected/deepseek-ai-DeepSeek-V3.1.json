@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "deepseek-ai-DeepSeek-V3.1.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS><｜User｜>Name a prime number.",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS>You are a helpful assistant.<｜User｜>Name a prime number.<｜Assistant｜><think></think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS>You are a helpful assistant.<｜User｜>Name a prime number.<｜Assistant｜><think></think>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜Assistant｜><think></think>",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS>You are a helpful assistant.<｜User｜>Name a prime number.<｜Assistant｜><think></think>7<｜end▁of▁sentence｜><｜User｜>Name one more.",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜Assistant｜><think>",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think></think>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜Assistant｜><think>",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS><｜User｜>Name a prime number.<｜Assistant｜><think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<BOS>You are a helpful assistant.<｜User｜>What is the weather in Paris?<｜Assistant｜><think></think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<BOS>You are a helpful assistant.<｜User｜>What is the weather in Paris?<｜Assistant｜><think></think><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\", \"unit\": \"celsius\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜><｜tool▁output▁begin｜>{\"temperature\": 18, \"condition\": \"light rain\"}<｜tool▁output▁end｜>",
+   "needs_undefined": false
+  }
+ ]
+}

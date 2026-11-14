@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "mistralai-Mistral-Nemo-Instruct-2407.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS>[INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS>[INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS>[INST]You are a helpful assistant.\n\nName a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS>[INST]Name a prime number.[/INST]7<EOS>[INST]You are a helpful assistant.\n\nName one more.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS>[INST]Name a prime number.[/INST]7<EOS>[INST]You are a helpful assistant.\n\nName one more.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS>[INST]Name a prime number.[/INST]7<EOS>[INST]Name one more.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS>[INST]Name a prime number.[/INST]7<EOS>[INST]Name one more.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS>[INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS>[INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS>[INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS>[INST]Name a prime number.[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<BOS>[AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}][/AVAILABLE_TOOLS][INST]You are a helpful assistant.\n\nWhat is the weather in Paris?[/INST]",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "failure": "TemplateError",
+   "message": "Tool call IDs should be alphanumeric strings with length 9!"
+  }
+ ]
+}

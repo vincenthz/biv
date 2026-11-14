@@ -34,8 +34,33 @@ struct MatArgs {
     ulong x_row_bytes;
 };
 
-inline float silu(float x) { return x / (1.0f + exp(-x)); }
-inline float sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
+// Fast math lets the compiler assume that no value is INF, so a score that
+// must not count is a finite value far below any real score. The start of a
+// running max is SCORE_FLOOR, and a masked score is MASKED_SCORE, below it.
+// Every exp of a score minus a running max then has a finite argument of at
+// most about FLT_MAX/4 in magnitude, and a masked or empty term gives
+// exp(-FLT_MAX/8) or less, which is 0, as exp(-INFINITY) is.
+constant float SCORE_FLOOR  = -FLT_MAX/8;
+constant float MASKED_SCORE = -FLT_MAX/4;
+
+// SIGMOID_OVERFLOW_X is ops::SIGMOID_OVERFLOW_X, which the engine defines
+// before this source when it compiles the library.
+#ifndef SIGMOID_OVERFLOW_X
+#error "the engine defines SIGMOID_OVERFLOW_X"
+#endif
+
+// At or above SIGMOID_OVERFLOW_X, the forms of ggml; below it exp(-x) can
+// overflow, so the form that computes exp(x)
+inline float sigmoid(float x) {
+    if (x < SIGMOID_OVERFLOW_X) {
+        const float e = exp(x);
+        return e / (1.0f + e);
+    }
+    return 1.0f / (1.0f + exp(-x));
+}
+inline float silu(float x) {
+    return x < SIGMOID_OVERFLOW_X ? x * sigmoid(x) : x / (1.0f + exp(-x));
+}
 inline float bf16_to_f32(ushort h) { return as_type<float>(uint(h) << 16); }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +722,31 @@ MMV_T("mmv_q4_K", block_q4_K)
 MMV_T("mmv_q5_K", block_q5_K)
 MMV_T("mmv_q6_K", block_q6_K)
 
+// two and four input fragments per simdgroup: one threadgroup takes 16 or
+// 32 input rows, so the weights are read once for that many rows
+#define MMV16_T(name, block) \
+template [[host_name(name)]] kernel void mmv<block, 1, 2, 4, 2>(constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
+#define MMV32_T(name, block) \
+template [[host_name(name)]] kernel void mmv<block, 1, 2, 4, 4>(constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
+MMV16_T("mmv16_f32", float4x4)
+MMV16_T("mmv16_f16", half4x4)
+MMV16_T("mmv16_bf16", block_bf16)
+MMV16_T("mmv16_q4_0", block_q4_0)
+MMV16_T("mmv16_q4_1", block_q4_1)
+MMV16_T("mmv16_q8_0", block_q8_0)
+MMV16_T("mmv16_q4_K", block_q4_K)
+MMV16_T("mmv16_q5_K", block_q5_K)
+MMV16_T("mmv16_q6_K", block_q6_K)
+MMV32_T("mmv32_f32", float4x4)
+MMV32_T("mmv32_f16", half4x4)
+MMV32_T("mmv32_bf16", block_bf16)
+MMV32_T("mmv32_q4_0", block_q4_0)
+MMV32_T("mmv32_q4_1", block_q4_1)
+MMV32_T("mmv32_q8_0", block_q8_0)
+MMV32_T("mmv32_q4_K", block_q4_K)
+MMV32_T("mmv32_q5_K", block_q5_K)
+MMV32_T("mmv32_q6_K", block_q6_K)
+
 // ---------------------------------------------------------------------------
 // matmul with simdgroup matrices: 64 weight rows x 32 input rows per
 // threadgroup of 4 simdgroups (ggml kernel_mul_mm, no tensor API).
@@ -944,7 +994,9 @@ kernel void rms_norm(
         ss = lane < (ntg + 31)/32 ? partial[lane] : 0.f;
         ss = simd_sum(ss);
     }
-    const float scale = rsqrt(ss/a.n + a.eps);
+    // the order of ops::rms_norm, with correctly rounded divisions and sqrt
+    const float mean = precise::divide(ss, float(a.n));
+    const float scale = precise::divide(1.0f, precise::sqrt(mean + a.eps));
 
     device float * o = out + row*a.ostride;
     for (int i = tid; i < a.n; i += ntg) {
@@ -1011,7 +1063,9 @@ kernel void attn_prep(
         ss += vals[j]*vals[j];
     }
     ss = simd_sum(ss);
-    const float scale = rsqrt(ss/hd + a.eps);
+    // the order of ops::rms_norm, with correctly rounded divisions and sqrt
+    const float mean = precise::divide(ss, float(hd));
+    const float scale = precise::divide(1.0f, precise::sqrt(mean + a.eps));
     for (int j = 0; j < E; j++) {
         vals[j] *= scale * w[lane + 32*j];
     }
@@ -1093,7 +1147,7 @@ kernel void attn_split(
                 acc[h][4*j + i] = 0.f;
             }
         }
-        m[h] = -INFINITY;
+        m[h] = SCORE_FLOOR;
         l[h] = 0.f;
     }
 
@@ -1141,11 +1195,12 @@ kernel void attn_split(
 
     float f[HPS];
     for (int h = 0; h < HPS; h++) {
-        float M = -INFINITY;
+        float M = SCORE_FLOOR;
         for (int r = 0; r < PS; r++) {
             M = max(M, sm[r*G + hg*HPS + h]);
         }
-        f[h] = m[h] == -INFINITY ? 0.f : exp(m[h] - M);
+        // an empty stride has kept its start value
+        f[h] = m[h] == SCORE_FLOOR ? 0.f : exp(m[h] - M);
     }
     for (int r = 0; r < PS; r++) {
         if (ps == r) {
@@ -1166,13 +1221,14 @@ kernel void attn_split(
     }
     if (tid < G) {
         const int g = tid;
-        float M = -INFINITY;
+        float M = SCORE_FLOOR;
         for (int r = 0; r < PS; r++) {
             M = max(M, sm[r*G + g]);
         }
         float L = 0.f;
         for (int r = 0; r < PS; r++) {
-            L += sm[r*G + g] == -INFINITY ? 0.f : sl[r*G + g]*exp(sm[r*G + g] - M);
+            // an empty stride has kept its start value
+            L += sm[r*G + g] == SCORE_FLOOR ? 0.f : sl[r*G + g]*exp(sm[r*G + g] - M);
         }
         part_ml[2*(part + g*a.splits)]     = M;
         part_ml[2*(part + g*a.splits) + 1] = L;
@@ -1203,8 +1259,8 @@ kernel void attn_reduce(
     const int hd   = a.hd;
     const int part = (t*a.n_head + head)*a.splits;
 
-    // split 0 always holds position 0, so M is finite
-    float M = -INFINITY;
+    // split 0 always holds position 0, so M is a real score
+    float M = SCORE_FLOOR;
     for (int s = 0; s < a.splits; s++) {
         M = max(M, part_ml[2*(part + s)]);
     }
@@ -1290,7 +1346,7 @@ kernel void attn_flash(
     float L[NQ];
     FOR_UNROLL (int j = 0; j < NQ; j++) {
         last[j] = a.pos0 + min(row0 + sg*NQ + j, rows - 1)/G;
-        M[j] = -FLT_MAX/2;
+        M[j] = SCORE_FLOOR;
         L[j] = 0.f;
     }
     const int last_end = a.pos0 + (min(row0 + R, rows) - 1)/G + 1;
@@ -1348,7 +1404,7 @@ kernel void attn_flash(
             float m = M[j];
             FOR_UNROLL (int c = 0; c < CL; c++) {
                 const int i = lane + 32*c;
-                s[c] = p0 + i <= last[j] && p0 + i < end ? ss[r*C + i] : -INFINITY;
+                s[c] = p0 + i <= last[j] && p0 + i < end ? ss[r*C + i] : MASKED_SCORE;
                 m = max(m, s[c]);
             }
             m = simd_max(m);
@@ -1549,10 +1605,10 @@ kernel void gdn(
         k4 *= rsqrt(simd_sum(dot(k4, k4)) + a.eps);
 
         const float x  = alpha[t*a.hv + head] + dt;
-        const float sp = x > 20.f ? x : log(1.f + exp(x));
+        const float sp = x > 20.f ? x : precise::log(1.f + precise::exp(x));
         const float b  = sigmoid(beta[t*a.hv + head]);
 
-        ls *= exp(sp * an);
+        ls *= precise::exp(sp * an);
         const float s_k = simd_sum(dot(ls, k4));
         const float d = (vj - s_k) * b;
         ls += k4 * d;
@@ -1610,7 +1666,7 @@ kernel void moe_route(
     const short nsg = (ntg + 31)/32;
     device const float * l = logits + tg*ne;
 
-    float m = -INFINITY;
+    float m = SCORE_FLOOR;
     for (int i = tid; i < ne; i += ntg) {
         m = max(m, l[i]);
     }

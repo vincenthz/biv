@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "ibm-granite-granite-4.0.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>7<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name one more.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>7<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name one more.<|end_of_text|>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>7<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name one more.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>7<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name one more.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant. Please ensure responses are professional, accurate, and safe.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.\n\nYou are a helpful assistant with access to the following tools. You may call one or more tools to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each tool call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>. If a tool does not exist in the provided list of tools, notify the user that you do not have the ability to fulfill the request.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>What is the weather in Paris?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.\n\nYou are a helpful assistant with access to the following tools. You may call one or more tools to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each tool call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>. If a tool does not exist in the provided list of tools, notify the user that you do not have the ability to fulfill the request.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>What is the weather in Paris?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|><tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"unit\": \"celsius\"}}\n</tool_call><|end_of_text|>\n<|start_of_role|>user<|end_of_role|>\n<tool_response>\n{\"temperature\": 18, \"condition\": \"light rain\"}\n</tool_response><|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": false
+  }
+ ]
+}

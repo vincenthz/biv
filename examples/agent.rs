@@ -224,6 +224,8 @@ fn main() {
     // whether the text printed so far ends in the middle of a line
     let mut mid_line = false;
     let mut on_event = |ev: Event<'_>| match ev {
+        // the text events show the answer
+        Event::Token(_) => {}
         Event::Thinking(t) => {
             print!("\x1b[2m{t}\x1b[0m");
             mid_line = !t.ends_with('\n');

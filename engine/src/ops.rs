@@ -3,7 +3,6 @@
 
 use core::cell::OnceCell;
 
-#[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
 use crate::par::{self, *};
 use crate::prelude::*;
@@ -156,9 +155,22 @@ pub fn l2_norm(x: &mut [f32], group: usize, eps: f32) {
     }
 }
 
+/// The input below which `sigmoid` computes `exp(x) / (1 + exp(x))` in
+/// place of `1 / (1 + exp(-x))`, on the CPU and in the Metal kernels, which
+/// get it as a define. Below it `exp(-x)` can overflow: ln(f32::MAX) is about
+/// 88.7, and the margin of about 8.7 covers the error of the fast exp of
+/// Metal. At or above it both paths keep the forms of ggml, so their results
+/// do not change there.
+pub const SIGMOID_OVERFLOW_X: f32 = -80.0;
+
 #[inline]
 pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    if x < SIGMOID_OVERFLOW_X {
+        let e = Float::exp(x);
+        e / (1.0 + e)
+    } else {
+        1.0 / (1.0 + Float::exp(-x))
+    }
 }
 
 #[inline]
@@ -169,7 +181,11 @@ pub fn silu(x: f32) -> f32 {
 #[inline]
 pub fn softplus(x: f32) -> f32 {
     // same threshold as ggml
-    if x > 20.0 { x } else { x.exp().ln_1p() }
+    if x > 20.0 {
+        x
+    } else {
+        Float::ln_1p(Float::exp(x))
+    }
 }
 
 pub fn add_inplace(x: &mut [f32], y: &[f32]) {
@@ -193,9 +209,38 @@ pub fn softmax(x: &mut [f32]) {
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
     for v in x.iter_mut() {
-        *v = (*v - max).exp();
+        *v = Float::exp(*v - max);
         sum += *v;
     }
     let inv = 1.0 / sum;
     x.iter_mut().for_each(|v| *v *= inv);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Inputs at and above SIGMOID_OVERFLOW_X, in steps of this size
+    const STEP: f32 = 0.25;
+    /// The inputs far below SIGMOID_OVERFLOW_X, where exp(-x) overflows
+    const DEAD: [f32; 3] = [-104.0, -1.0e4, f32::MIN];
+
+    #[test]
+    fn sigmoid_keeps_the_ggml_form_at_and_above_the_overflow_input() {
+        let mut x = SIGMOID_OVERFLOW_X;
+        while x < -SIGMOID_OVERFLOW_X {
+            let ggml = 1.0 / (1.0 + Float::exp(-x));
+            assert_eq!(sigmoid(x).to_bits(), ggml.to_bits(), "x = {x}");
+            assert_eq!(silu(x).to_bits(), (x * ggml).to_bits(), "x = {x}");
+            x += STEP;
+        }
+    }
+
+    #[test]
+    fn sigmoid_below_the_overflow_input_is_finite() {
+        for x in DEAD {
+            assert_eq!(sigmoid(x), 0.0, "x = {x}");
+            assert!(silu(x).is_finite(), "x = {x}");
+        }
+    }
 }

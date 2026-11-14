@@ -14,6 +14,7 @@ extern crate std;
 #[cfg(feature = "std")]
 pub mod batch;
 pub mod chat;
+pub mod conversation;
 pub mod engine;
 mod error;
 pub mod gguf;
@@ -24,6 +25,7 @@ pub mod model;
 pub mod ops;
 pub mod quant;
 pub mod sampler;
+pub mod template;
 pub mod tokenizer;
 pub mod transcript;
 

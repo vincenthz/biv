@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "LFM2.5-Instruct.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.\nList of tools: [{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}]<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<|im_end|>\n<|im_start|>tool\n{\"temperature\": 18, \"condition\": \"light rain\"}<|im_end|>\n<|im_start|>assistant\n",
+   "needs_undefined": false
+  }
+ ]
+}

@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "openai-gpt-oss-120b.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Name a prime number.<|end|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "system_user",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nYou are a helpful assistant.\n\n<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nYou are a helpful assistant.\n\n<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant<|channel|>final<|message|>7<|end|><|start|>user<|message|>Name one more.<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nYou are a helpful assistant.\n\n<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant<|channel|>final<|message|>7<|end|><|start|>user<|message|>Name one more.<|end|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant<|channel|>final<|message|>7<|end|><|start|>user<|message|>Name one more.<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant<|channel|>final<|message|>7<|end|><|start|>user<|message|>Name one more.<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "effort_low",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: low\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "effort_medium",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: xhigh\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Name a prime number.<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "tools",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions\n\nYou are a helpful assistant.\n\n# Tools\n\n## functions\n\nnamespace functions {\n\n// Current weather in a city\ntype get_weather = (_: {\n// City name\ncity: string,\nunit?: \"celsius\" | \"fahrenheit\",\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>What is the weather in Paris?<|end|><|start|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-05\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions\n\nYou are a helpful assistant.\n\n# Tools\n\n## functions\n\nnamespace functions {\n\n// Current weather in a city\ntype get_weather = (_: {\n// City name\ncity: string,\nunit?: \"celsius\" | \"fahrenheit\",\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>What is the weather in Paris?<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\", \"unit\": \"celsius\"}<|call|><|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>\"{\\\"temperature\\\": 18, \\\"condition\\\": \\\"light rain\\\"}\"<|end|><|start|>assistant",
+   "needs_undefined": true
+  }
+ ]
+}
