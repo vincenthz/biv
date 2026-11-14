@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "Reka-Edge.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "human: Name a prime number.<sep>assistant:",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "human: Name a prime number.<sep>",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "system: You are a helpful assistant.\n\n<sep>human: Name a prime number.<sep>assistant:",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "system: You are a helpful assistant.\n\n<sep>human: Name a prime number.<sep>assistant: 7\n\n<sep>human: Name one more.<sep>assistant:",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "system: You are a helpful assistant.\n\n<sep>human: Name a prime number.<sep>assistant: 7\n\n<sep>human: Name one more.<sep>",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "human: Name a prime number.<sep>assistant: 7\n\n<sep>human: Name one more.<sep>assistant: <think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "human: Name a prime number.<sep>assistant: 7\n\n<sep>human: Name one more.<sep>assistant: <think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "human: Name a prime number.<sep>assistant: <think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "human: Name a prime number.<sep>assistant: <think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "human: Name a prime number.<sep>assistant: <think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "human: Name a prime number.<sep>assistant: <think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "system: You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<sep>human: What is the weather in Paris?<sep>assistant:",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "system: You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<sep>human: What is the weather in Paris?<sep>assistant: <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"unit\": \"celsius\"}}\n</tool_call>\n\n<sep>human: <tool_response>\n{\"temperature\": 18, \"condition\": \"light rain\"}\n</tool_response><sep>assistant:",
+   "needs_undefined": true
+  }
+ ]
+}

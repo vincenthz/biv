@@ -5,6 +5,8 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -16,7 +18,9 @@ use objc2_metal::{
 };
 
 use crate::Error;
-use crate::engine::{Batch, DraftLogits, Engine, Pass, SeqId, Session, Snapshot, Work, insert};
+use crate::engine::{
+    Batch, DraftLogits, Engine, HostTime, Pass, SeqId, Session, Snapshot, Work, insert,
+};
 use crate::memory::{DeviceMemory, ModelMemory, SessionMemory, Shape};
 use crate::model::{
     Config, DRAFT_CAP, DraftVocab, Experts, Ffn, Layer, Mixer, Model, copy_head_rows,
@@ -27,6 +31,14 @@ use crate::quant::GgmlType;
 use crate::tokenizer::TokenId;
 
 const SOURCE: &str = include_str!("kernels.metal");
+
+/// The Metal source with the constants that it shares with the CPU path
+fn source() -> String {
+    format!(
+        "#define SIGMOID_OVERFLOW_X {:?}f\n{SOURCE}",
+        crate::ops::SIGMOID_OVERFLOW_X
+    )
+}
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
@@ -45,12 +57,21 @@ const PAGE: usize = if cfg!(target_arch = "aarch64") {
 /// from the cache (a verify pass of 2 tokens costs 1.2x a decode step, 3 1.6x)
 const MV_MAX_ROWS: usize = 3;
 /// Matmul inputs of up to this many rows use the `mmv` kernels, which read the
-/// weights once for 8 input rows (on an M2 Max, a pass of 4 to 8 tokens costs
-/// 1.75-1.9x a decode step, 12 to 16 3.2-3.4x); more use the `mm`
-/// kernels, whose tiles are 32 rows (~4.7x from 5 to 32 tokens)
-const MMV_MAX_ROWS: usize = 16;
+/// weights once for the input rows of a threadgroup; more use the `mm`
+/// kernels, whose tiles are 32 rows (on an M3 Max, a pass of 17 to 32 tokens
+/// on `mm` cost 4.8-5.0x a decode step)
+pub const MMV_MAX_ROWS: usize = MMV32_ROWS;
 /// Input rows and weight rows (2 simdgroups of 8) per `mmv` threadgroup
-const MMV_ROWS: usize = 8;
+pub const MMV_ROWS: usize = 8;
+/// Input rows per threadgroup of the `mmv16` and `mmv32` kernels, which hold
+/// two and four input fragments of 8 rows in each simdgroup. Each output of
+/// `mmv16` has the same bits as with `mmv`; `mmv32` takes passes of 17 to 32
+/// rows from `mm`, and its sums round differently.
+pub const MMV16_ROWS: usize = 16;
+pub const MMV32_ROWS: usize = 32;
+/// The row limits of the `mmv` kernels that [`MetalEngine::with_mmv_rows`]
+/// takes: [`MMV16_ROWS`] gives the numbers of `mm` from 17 rows
+pub const MMV_ROW_LIMITS: [usize; 2] = [MMV16_ROWS, MMV32_ROWS];
 const MMV_WEIGHT_ROWS: usize = 16;
 /// The pairs of an expert are multiplied by `mm_id` in tiles of 32, the last
 /// one too when it has this many pairs or more; the others by `mmv_id` in
@@ -266,6 +287,24 @@ kernels! {
     MmvQ4K => "mmv_q4_K",
     MmvQ5K => "mmv_q5_K",
     MmvQ6K => "mmv_q6_K",
+    Mmv16F32 => "mmv16_f32",
+    Mmv16F16 => "mmv16_f16",
+    Mmv16Bf16 => "mmv16_bf16",
+    Mmv16Q4_0 => "mmv16_q4_0",
+    Mmv16Q4_1 => "mmv16_q4_1",
+    Mmv16Q8_0 => "mmv16_q8_0",
+    Mmv16Q4K => "mmv16_q4_K",
+    Mmv16Q5K => "mmv16_q5_K",
+    Mmv16Q6K => "mmv16_q6_K",
+    Mmv32F32 => "mmv32_f32",
+    Mmv32F16 => "mmv32_f16",
+    Mmv32Bf16 => "mmv32_bf16",
+    Mmv32Q4_0 => "mmv32_q4_0",
+    Mmv32Q4_1 => "mmv32_q4_1",
+    Mmv32Q8_0 => "mmv32_q8_0",
+    Mmv32Q4K => "mmv32_q4_K",
+    Mmv32Q5K => "mmv32_q5_K",
+    Mmv32Q6K => "mmv32_q6_K",
     AddInplace => "add_inplace",
     Swiglu => "swiglu",
     RmsNorm => "rms_norm",
@@ -338,6 +377,38 @@ fn mmv_kernel(ty: GgmlType) -> Option<Kernel> {
         GgmlType::Q4K => Kernel::MmvQ4K,
         GgmlType::Q5K => Kernel::MmvQ5K,
         GgmlType::Q6K => Kernel::MmvQ6K,
+        _ => return None,
+    })
+}
+
+/// The `mmv` kernels that take 16 input rows a threadgroup
+fn mmv16_kernel(ty: GgmlType) -> Option<Kernel> {
+    Some(match ty {
+        GgmlType::F32 => Kernel::Mmv16F32,
+        GgmlType::F16 => Kernel::Mmv16F16,
+        GgmlType::BF16 => Kernel::Mmv16Bf16,
+        GgmlType::Q4_0 => Kernel::Mmv16Q4_0,
+        GgmlType::Q4_1 => Kernel::Mmv16Q4_1,
+        GgmlType::Q8_0 => Kernel::Mmv16Q8_0,
+        GgmlType::Q4K => Kernel::Mmv16Q4K,
+        GgmlType::Q5K => Kernel::Mmv16Q5K,
+        GgmlType::Q6K => Kernel::Mmv16Q6K,
+        _ => return None,
+    })
+}
+
+/// The `mmv` kernels that take 32 input rows a threadgroup
+fn mmv32_kernel(ty: GgmlType) -> Option<Kernel> {
+    Some(match ty {
+        GgmlType::F32 => Kernel::Mmv32F32,
+        GgmlType::F16 => Kernel::Mmv32F16,
+        GgmlType::BF16 => Kernel::Mmv32Bf16,
+        GgmlType::Q4_0 => Kernel::Mmv32Q4_0,
+        GgmlType::Q4_1 => Kernel::Mmv32Q4_1,
+        GgmlType::Q8_0 => Kernel::Mmv32Q8_0,
+        GgmlType::Q4K => Kernel::Mmv32Q4K,
+        GgmlType::Q5K => Kernel::Mmv32Q5K,
+        GgmlType::Q6K => Kernel::Mmv32Q6K,
         _ => return None,
     })
 }
@@ -459,6 +530,107 @@ pub struct MetalEngine<'m> {
     inv_freq: Buffer,
     attn_nsg: usize,
     max_batch: usize,
+    /// Matmul inputs of up to this many rows use the `mmv` kernels
+    mmv_max_rows: usize,
+    /// The GPU time of all command buffers of the engine, in nanoseconds
+    gpu_nanos: AtomicU64,
+    /// The host time of all command buffers of the engine, by part, in
+    /// nanoseconds: see [`HostTime`]
+    encode_nanos: AtomicU64,
+    wait_nanos: AtomicU64,
+    readback_nanos: AtomicU64,
+    queue_nanos: AtomicU64,
+    schedule_nanos: AtomicU64,
+    completion_nanos: AtomicU64,
+    /// the command buffers with no times in order: see [`HostTime`]
+    untimed: AtomicU64,
+    /// the units of the host clock of Metal, for its times in seconds
+    host_clock: HostClock,
+}
+
+/// The ratio of mach_absolute_time to nanoseconds
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+/// The host clock of the times that Metal gives for a command buffer: the
+/// seconds of mach_absolute_time
+#[derive(Clone, Copy, Debug)]
+struct HostClock {
+    timebase: MachTimebaseInfo,
+}
+
+/// The seconds of a nanosecond
+const SECONDS_PER_NANO: f64 = 1e-9;
+
+impl HostClock {
+    fn new() -> Self {
+        let mut timebase = MachTimebaseInfo::default();
+        // SAFETY: mach_timebase_info writes the struct that it is given
+        let status = unsafe { mach_timebase_info(&mut timebase) };
+        assert!(
+            status == 0 && timebase.denom != 0,
+            "metal: MachTimebaseUnknown: mach_timebase_info gave {status}"
+        );
+        HostClock { timebase }
+    }
+
+    /// The time now, in the seconds of the times of Metal
+    fn now(&self) -> f64 {
+        // SAFETY: mach_absolute_time reads a clock and takes no argument
+        let ticks = unsafe { mach_absolute_time() };
+        let nanos = ticks as f64 * f64::from(self.timebase.numer) / f64::from(self.timebase.denom);
+        nanos * SECONDS_PER_NANO
+    }
+}
+
+/// The times of one command buffer on the host clock of Metal, in order:
+/// its commit, the start of the schedule of the driver, the start and the
+/// end on the device, and the return of the wait
+#[derive(Clone, Copy, Debug)]
+struct BufferTimes {
+    committed: f64,
+    kernel_start: f64,
+    gpu_start: f64,
+    gpu_end: f64,
+    returned: f64,
+}
+
+impl BufferTimes {
+    /// The four parts of the wait (queue, schedule, device, completion),
+    /// or None when the device did not give its times: a time of 0 or a
+    /// time before the one before it
+    fn parts(self) -> Option<[Duration; 4]> {
+        let t = [
+            self.committed,
+            self.kernel_start,
+            self.gpu_start,
+            self.gpu_end,
+            self.returned,
+        ];
+        if t.iter().any(|x| *x <= 0.0) || t.windows(2).any(|w| w[1] < w[0]) {
+            return None;
+        }
+        Some([0, 1, 2, 3].map(|i| Duration::from_secs_f64(t[i + 1] - t[i])))
+    }
+}
+
+/// Add `time` to the nanoseconds of `counter`
+fn add_time(counter: &AtomicU64, time: Duration) {
+    counter.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// The time of the nanoseconds of `counter`
+fn time_of(counter: &AtomicU64) -> Duration {
+    Duration::from_nanos(counter.load(Ordering::Relaxed))
 }
 
 fn upload(device: &Device, data: &[f32]) -> Result<Buffer, Error> {
@@ -608,6 +780,22 @@ fn gpu_layer(device: &Device, l: &Layer<'_>) -> Result<GpuLayer, Error> {
 
 impl<'m> MetalEngine<'m> {
     pub fn new(model: &'m Model<'m>, max_batch: usize) -> Result<Self, Error> {
+        Self::with_mmv_rows(model, max_batch, MMV_MAX_ROWS)
+    }
+
+    /// [`MetalEngine::new`] whose matmul inputs of up to `mmv_max_rows` rows
+    /// use the `mmv` kernels, and more the `mm` kernels. `mmv_max_rows` is
+    /// one of [`MMV_ROW_LIMITS`].
+    pub fn with_mmv_rows(
+        model: &'m Model<'m>,
+        max_batch: usize,
+        mmv_max_rows: usize,
+    ) -> Result<Self, Error> {
+        if !MMV_ROW_LIMITS.contains(&mmv_max_rows) {
+            return Err(backend(
+                "metal: the mmv row limit is not one of MMV_ROW_LIMITS",
+            ));
+        }
         let c = &model.cfg;
         if c.ssm_state != 128 || c.conv_kernel != 4 {
             return Err(backend(
@@ -626,7 +814,7 @@ impl<'m> MetalEngine<'m> {
 
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| backend("metal: no device"))?;
         let library = device
-            .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
+            .newLibraryWithSource_options_error(&NSString::from_str(&source()), None)
             .map_err(|e| {
                 backend(format!(
                     "metal: shader compilation failed: {}",
@@ -682,6 +870,16 @@ impl<'m> MetalEngine<'m> {
             layers,
             mtp,
             max_batch: max_batch.max(1),
+            mmv_max_rows,
+            gpu_nanos: AtomicU64::new(0),
+            encode_nanos: AtomicU64::new(0),
+            wait_nanos: AtomicU64::new(0),
+            readback_nanos: AtomicU64::new(0),
+            queue_nanos: AtomicU64::new(0),
+            schedule_nanos: AtomicU64::new(0),
+            completion_nanos: AtomicU64::new(0),
+            untimed: AtomicU64::new(0),
+            host_clock: HostClock::new(),
         })
     }
 
@@ -744,13 +942,22 @@ impl<'m> MetalEngine<'m> {
                     0,
                 )
             }
-            _ if n <= MMV_MAX_ROWS => self.dispatch(
-                enc,
-                mmv_kernel(w.ty).expect("checked at load"),
-                [w.rows.div_ceil(MMV_WEIGHT_ROWS), n.div_ceil(MMV_ROWS), 1],
-                [64, 1, 1],
-                0,
-            ),
+            _ if n <= self.mmv_max_rows => {
+                let (kernel, rows) = if n <= MMV_ROWS {
+                    (mmv_kernel(w.ty), MMV_ROWS)
+                } else if n <= MMV16_ROWS {
+                    (mmv16_kernel(w.ty), MMV16_ROWS)
+                } else {
+                    (mmv32_kernel(w.ty), MMV32_ROWS)
+                };
+                self.dispatch(
+                    enc,
+                    kernel.expect("checked at load"),
+                    [w.rows.div_ceil(MMV_WEIGHT_ROWS), n.div_ceil(rows), 1],
+                    [64, 1, 1],
+                    0,
+                )
+            }
             _ => {
                 let name = mm_kernel(w.ty).expect("checked at load");
                 self.dispatch(
@@ -859,6 +1066,7 @@ impl Engine for MetalEngine<'_> {
             ("device", self.device.name().to_string()),
             ("kv_cache", "f16".into()),
             ("max_batch", self.max_batch.to_string()),
+            ("mmv_max_rows", self.mmv_max_rows.to_string()),
         ]
     }
 
@@ -1521,6 +1729,7 @@ impl MetalEngine<'_> {
 
     /// Encode into one command buffer and wait for it
     fn submit(&self, encode: impl FnOnce(&Encoder)) {
+        let start = Instant::now();
         let cb = self
             .queue
             .commandBuffer()
@@ -1530,14 +1739,60 @@ impl MetalEngine<'_> {
             .expect("metal: no compute encoder");
         encode(&enc);
         enc.endEncoding();
+        // the clock of Metal before the commit: the driver can begin to
+        // schedule the command buffer inside the call
+        let committed_s = self.host_clock.now();
         cb.commit();
+        let committed = Instant::now();
         cb.waitUntilCompleted();
+        let returned_s = self.host_clock.now();
+        add_time(&self.wait_nanos, committed.elapsed());
+        add_time(&self.encode_nanos, committed - start);
         if cb.status() == MTLCommandBufferStatus::Error {
             let msg = cb
                 .error()
                 .map(|e| e.localizedDescription().to_string())
                 .unwrap_or_default();
             panic!("metal: command buffer failed: {msg}");
+        }
+        let times = BufferTimes {
+            committed: committed_s,
+            kernel_start: cb.kernelStartTime(),
+            gpu_start: cb.GPUStartTime(),
+            gpu_end: cb.GPUEndTime(),
+            returned: returned_s,
+        };
+        match times.parts() {
+            Some([queue, schedule, gpu, completion]) => {
+                add_time(&self.queue_nanos, queue);
+                add_time(&self.schedule_nanos, schedule);
+                add_time(&self.gpu_nanos, gpu);
+                add_time(&self.completion_nanos, completion);
+            }
+            // the pass goes on; its times are not counted, and the count of
+            // untimed command buffers tells the readers
+            None => {
+                self.untimed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The GPU time of the command buffers of the engine since it started,
+    /// of those with times only: see [`HostTime::untimed`]
+    pub fn gpu_time(&self) -> Duration {
+        time_of(&self.gpu_nanos)
+    }
+
+    /// The host time of all command buffers of the engine since it started
+    pub fn host_time(&self) -> HostTime {
+        HostTime {
+            encode: time_of(&self.encode_nanos),
+            wait: time_of(&self.wait_nanos),
+            readback: time_of(&self.readback_nanos),
+            queue: time_of(&self.queue_nanos),
+            schedule: time_of(&self.schedule_nanos),
+            completion: time_of(&self.completion_nanos),
+            untimed: self.untimed.load(Ordering::Relaxed),
         }
     }
 
@@ -1719,7 +1974,8 @@ impl MetalEngine<'_> {
             }
         });
 
-        items
+        let readback = Instant::now();
+        let logits = items
             .iter_mut()
             .zip(&places)
             .map(|((seq, _, pass), p)| {
@@ -1750,7 +2006,9 @@ impl MetalEngine<'_> {
                     .map(|t| host(&s.logits, t * c.n_vocab, c.n_vocab).to_vec())
                     .collect()
             })
-            .collect()
+            .collect();
+        add_time(&self.readback_nanos, readback.elapsed());
+        logits
     }
 
     /// Up to `n` tokens the MTP head of `seq` predicts after `next`, with the
@@ -2395,6 +2653,14 @@ impl MetalBatch<'_> {
 }
 
 impl Batch for MetalBatch<'_> {
+    fn gpu_time(&self) -> Option<Duration> {
+        Some(self.e.gpu_time())
+    }
+
+    fn host_time(&self) -> Option<HostTime> {
+        Some(self.e.host_time())
+    }
+
     fn add(&mut self, context: usize, draft: usize) -> Result<SeqId, Error> {
         let seq = Seq::new(self.e, context, draft, self.s.batch)?;
         Ok(insert(&mut self.seqs, seq))
@@ -2483,5 +2749,45 @@ impl Batch for MetalBatch<'_> {
     fn restore(&mut self, seq: SeqId, snapshot: &Snapshot) -> Result<(), Error> {
         let e = self.e;
         self.seq_mut(seq).restore(e, snapshot)
+    }
+}
+
+#[cfg(test)]
+mod buffer_times_tests {
+    use super::{BufferTimes, Duration};
+
+    /// Times of one command buffer in order, in seconds of the host clock
+    const IN_ORDER: [f64; 5] = [10.0, 10.5, 11.0, 13.0, 13.25];
+
+    fn times(t: [f64; 5]) -> BufferTimes {
+        BufferTimes {
+            committed: t[0],
+            kernel_start: t[1],
+            gpu_start: t[2],
+            gpu_end: t[3],
+            returned: t[4],
+        }
+    }
+
+    #[test]
+    fn the_parts_of_a_wait_add_up_to_it() {
+        let parts = times(IN_ORDER).parts().expect("times in order");
+        assert_eq!(parts, [0.5, 0.5, 2.0, 0.25].map(Duration::from_secs_f64));
+    }
+
+    #[test]
+    fn a_missing_or_reversed_time_gives_no_parts() {
+        for i in 1..IN_ORDER.len() {
+            let mut missing = IN_ORDER;
+            missing[i] = 0.0;
+            assert_eq!(times(missing).parts(), None, "time {i} missing");
+            let mut reversed = IN_ORDER;
+            reversed[i] = IN_ORDER[i - 1] - 1.0;
+            assert_eq!(
+                times(reversed).parts(),
+                None,
+                "time {i} before the one before it"
+            );
+        }
     }
 }

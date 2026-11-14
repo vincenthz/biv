@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "Apriel-1.6-15b-Thinker-fixed.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\nYou are a helpful assistant.\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\nYou are a helpful assistant.\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\n7\n<|end|>\n<|begin_user|>\nName one more.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\nYou are a helpful assistant.\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\n7\n<|end|>\n<|begin_user|>\nName one more.",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\n7\n<|end|>\n<|begin_user|>\nName one more.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\n7\n<|end|>\n<|begin_user|>\nName one more.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\n<|begin_user|>\nName a prime number.\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\nYou are a helpful assistant.\nYou are provided with function signatures within <available_tools></available_tools> XML tags.\n        You may call one or more functions to assist with the user query.\n        Don't make assumptions about the arguments. You should infer the argument values from previous\n        user responses and the system message.\n        Here are the available tools: \n        <available_tools>\n{'type': 'function', 'function': {'name': 'get_weather', 'description': 'Current weather in a city', 'parameters': {'type': 'object', 'properties': {'city': {'type': 'string', 'description': 'City name'}, 'unit': {'type': 'string', 'enum': ['celsius', 'fahrenheit']}}, 'required': ['city']}}}        \n        </available_tools>.\n\n        Return all function calls as a list of JSON objects within <tool_calls></tool_calls> XML tags.\n        Each JSON object should contain a function name and arguments as follows:\n        <tool_calls>[\n            {\"name\": <function-name-1>, \"arguments\": <args-dict-1>},\n            {\"name\": <function-name-2>, \"arguments\": <args-dict-2>},\n            ...\n        ]</tool_calls>\n<|begin_user|>\nWhat is the weather in Paris?\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<BOS><|begin_system|>\nYou are a thoughtful, systematic AI assistant from ServiceNow Language Models (SLAM) lab.\n    Analyze each question carefully, present your reasoning step-by-step, then provide the final\n    response after the marker [BEGIN FINAL RESPONSE].\nYou are a helpful assistant.\nYou are provided with function signatures within <available_tools></available_tools> XML tags.\n        You may call one or more functions to assist with the user query.\n        Don't make assumptions about the arguments. You should infer the argument values from previous\n        user responses and the system message.\n        Here are the available tools: \n        <available_tools>\n{'type': 'function', 'function': {'name': 'get_weather', 'description': 'Current weather in a city', 'parameters': {'type': 'object', 'properties': {'city': {'type': 'string', 'description': 'City name'}, 'unit': {'type': 'string', 'enum': ['celsius', 'fahrenheit']}}, 'required': ['city']}}}        \n        </available_tools>.\n\n        Return all function calls as a list of JSON objects within <tool_calls></tool_calls> XML tags.\n        Each JSON object should contain a function name and arguments as follows:\n        <tool_calls>[\n            {\"name\": <function-name-1>, \"arguments\": <args-dict-1>},\n            {\"name\": <function-name-2>, \"arguments\": <args-dict-2>},\n            ...\n        ]</tool_calls>\n<|begin_user|>\nWhat is the weather in Paris?\n<|begin_assistant|>\n\n<tool_calls>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"unit\": \"celsius\"}, \"id\": \"call_1\"}]</tool_calls>\n<|end|>\n<|begin_tool_result|>\n{\"temperature\": 18, \"condition\": \"light rain\"}\n\n\n\n<|begin_assistant|>\nHere are my reasoning steps:\n",
+   "needs_undefined": false
+  }
+ ]
+}

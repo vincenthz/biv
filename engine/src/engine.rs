@@ -92,6 +92,76 @@ pub enum Pass {
 /// A sequence of a [`Batch`]
 pub type SeqId = usize;
 
+/// The host time of the command buffers of an engine since it started, by
+/// part, see [`Batch::host_time`]. A difference over a pass is the host time
+/// of the pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostTime {
+    /// from the start of each command buffer to its commit: the encode of
+    /// its kernels
+    pub encode: core::time::Duration,
+    /// the wait for each command buffer after its commit, its device time
+    /// included
+    pub wait: core::time::Duration,
+    /// the copies of the rows of logits of each pass out of the shared
+    /// buffer, after its wait
+    pub readback: core::time::Duration,
+    /// the first part of the wait: from the commit of each command buffer to
+    /// the time that the driver began to schedule it
+    pub queue: core::time::Duration,
+    /// the second part of the wait: from that time to the start of the
+    /// command buffer on the device. The third part is the device time of
+    /// [`Batch::gpu_time`].
+    pub schedule: core::time::Duration,
+    /// the last part of the wait: from the end of each command buffer on the
+    /// device to the return of the wait for it
+    pub completion: core::time::Duration,
+    /// the command buffers for which the device did not give its four times
+    /// in order: the parts of the wait and the device time hold nothing of
+    /// them. A reader that reports or decides on these times refuses them
+    /// by name when this count is not 0.
+    pub untimed: u64,
+}
+
+impl HostTime {
+    /// No host time
+    pub const ZERO: HostTime = HostTime {
+        encode: core::time::Duration::ZERO,
+        wait: core::time::Duration::ZERO,
+        readback: core::time::Duration::ZERO,
+        queue: core::time::Duration::ZERO,
+        schedule: core::time::Duration::ZERO,
+        completion: core::time::Duration::ZERO,
+        untimed: 0,
+    };
+
+    /// The host time from `before` to this one
+    pub fn since(self, before: HostTime) -> HostTime {
+        HostTime {
+            encode: self.encode - before.encode,
+            wait: self.wait - before.wait,
+            readback: self.readback - before.readback,
+            queue: self.queue - before.queue,
+            schedule: self.schedule - before.schedule,
+            completion: self.completion - before.completion,
+            untimed: self.untimed - before.untimed,
+        }
+    }
+
+    /// The host time of this one and `other`
+    pub fn plus(self, other: HostTime) -> HostTime {
+        HostTime {
+            encode: self.encode + other.encode,
+            wait: self.wait + other.wait,
+            readback: self.readback + other.readback,
+            queue: self.queue + other.queue,
+            schedule: self.schedule + other.schedule,
+            completion: self.completion + other.completion,
+            untimed: self.untimed + other.untimed,
+        }
+    }
+}
+
 /// A sequence's part of a batched pass
 #[derive(Clone, Copy, Debug)]
 pub struct Work<'a> {
@@ -126,6 +196,16 @@ pub trait Batch {
 
     /// Tokens of a pass, at most
     fn max_tokens(&self) -> usize;
+
+    /// The time that the device of the engine spent on the work of this
+    /// batch's engine since it started, or None when the engine has no
+    /// device clock. A difference over a pass is the device time of the
+    /// pass.
+    fn gpu_time(&self) -> Option<core::time::Duration>;
+
+    /// The host time of the command buffers of this batch's engine since it
+    /// started, by part, or None when the engine has no command buffers
+    fn host_time(&self) -> Option<HostTime>;
 
     /// Rows of logits of a pass, at most
     fn max_logits(&self) -> usize;
@@ -190,6 +270,14 @@ impl<'e> Sequential<'e> {
 }
 
 impl Batch for Sequential<'_> {
+    fn gpu_time(&self) -> Option<core::time::Duration> {
+        None
+    }
+
+    fn host_time(&self) -> Option<HostTime> {
+        None
+    }
+
     fn add(&mut self, context: usize, draft: usize) -> Result<SeqId, Error> {
         let session = self.engine.new_session(context, draft)?;
         Ok(insert(&mut self.seqs, session))
@@ -527,5 +615,37 @@ impl Session for CpuSession<'_> {
 
     fn restore(&mut self, snapshot: &Snapshot) -> Result<(), Error> {
         self.state.restore(snapshot.data::<StateSnapshot>()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostTime;
+    use core::time::Duration;
+
+    /// Host times of two reads of the counters, in milliseconds
+    const BEFORE_MS: [u64; 6] = [3, 5, 7, 1, 2, 3];
+    const AFTER_MS: [u64; 6] = [4, 9, 8, 2, 4, 6];
+
+    fn time(ms: [u64; 6], untimed: u64) -> HostTime {
+        let [encode, wait, readback, queue, schedule, completion] = ms.map(Duration::from_millis);
+        HostTime {
+            encode,
+            wait,
+            readback,
+            queue,
+            schedule,
+            completion,
+            untimed,
+        }
+    }
+
+    #[test]
+    fn a_host_time_since_an_earlier_one_adds_back_to_it() {
+        let (before, after) = (time(BEFORE_MS, 2), time(AFTER_MS, 3));
+        let pass = after.since(before);
+        assert_eq!(pass, time([1, 4, 1, 1, 2, 3], 1));
+        assert_eq!(before.plus(pass), after);
+        assert_eq!(HostTime::ZERO.plus(pass), pass);
     }
 }

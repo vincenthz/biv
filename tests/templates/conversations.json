@@ -1,0 +1,352 @@
+{
+ "about": "The conversations that tools/template_fixtures.py renders with each template of corpus/, and that the biv template test renders the same way. Each case sets every variable that biv sets: bos_token and eos_token (marker texts here, not the tokens of a model), enable_thinking, preserve_thinking, and reasoning_effort only when enable_thinking is true. strftime_now gives the fixed date of the tool.",
+ "cases": [
+  {
+   "name": "user",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    }
+   ]
+  },
+  {
+   "name": "user_no_generation_prompt",
+   "add_generation_prompt": false,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    }
+   ]
+  },
+  {
+   "name": "system_user",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    }
+   ]
+  },
+  {
+   "name": "two_turns",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    },
+    {
+     "role": "assistant",
+     "content": "7"
+    },
+    {
+     "role": "user",
+     "content": "Name one more."
+    }
+   ]
+  },
+  {
+   "name": "two_turns_no_generation_prompt",
+   "add_generation_prompt": false,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    },
+    {
+     "role": "assistant",
+     "content": "7"
+    },
+    {
+     "role": "user",
+     "content": "Name one more."
+    }
+   ]
+  },
+  {
+   "name": "reasoned_answer",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": true,
+    "reasoning_effort": "medium",
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    },
+    {
+     "role": "assistant",
+     "content": "7",
+     "reasoning_content": "Seven has no divisor but 1 and 7."
+    },
+    {
+     "role": "user",
+     "content": "Name one more."
+    }
+   ]
+  },
+  {
+   "name": "reasoned_answer_not_preserved",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": true,
+    "reasoning_effort": "medium",
+    "preserve_thinking": false
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    },
+    {
+     "role": "assistant",
+     "content": "7",
+     "reasoning_content": "Seven has no divisor but 1 and 7."
+    },
+    {
+     "role": "user",
+     "content": "Name one more."
+    }
+   ]
+  },
+  {
+   "name": "thinking_on",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": true,
+    "reasoning_effort": "medium",
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    }
+   ]
+  },
+  {
+   "name": "effort_low",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": true,
+    "reasoning_effort": "low",
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    }
+   ]
+  },
+  {
+   "name": "effort_medium",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": true,
+    "reasoning_effort": "medium",
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    }
+   ]
+  },
+  {
+   "name": "effort_xhigh",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": true,
+    "reasoning_effort": "xhigh",
+    "preserve_thinking": true
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Name a prime number."
+    }
+   ]
+  },
+  {
+   "name": "tools",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    }
+   ]
+  },
+  {
+   "name": "tool_call_and_response",
+   "add_generation_prompt": true,
+   "variables": {
+    "bos_token": "<BOS>",
+    "eos_token": "<EOS>",
+    "enable_thinking": false,
+    "preserve_thinking": true
+   },
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "unit": {
+         "type": "string",
+         "enum": [
+          "celsius",
+          "fahrenheit"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "unit": "celsius"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "name": "get_weather",
+     "content": "{\"temperature\": 18, \"condition\": \"light rain\"}"
+    }
+   ]
+  }
+ ]
+}

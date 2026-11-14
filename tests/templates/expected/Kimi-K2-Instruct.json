@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "Kimi-K2-Instruct.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Name a prime number.<|im_end|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<|im_system|>system<|im_middle|>You are a helpful assistant.<|im_end|><|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<|im_system|>system<|im_middle|>You are a helpful assistant.<|im_end|><|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>7<|im_end|><|im_user|>user<|im_middle|>Name one more.<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<|im_system|>system<|im_middle|>You are a helpful assistant.<|im_end|><|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>7<|im_end|><|im_user|>user<|im_middle|>Name one more.<|im_end|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>7<|im_end|><|im_user|>user<|im_middle|>Name one more.<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>7<|im_end|><|im_user|>user<|im_middle|>Name one more.<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n<|im_user|>user<|im_middle|>Name a prime number.<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<|im_system|>tool_declare<|im_middle|>[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}]<|im_end|><|im_system|>system<|im_middle|>You are a helpful assistant.<|im_end|><|im_user|>user<|im_middle|>What is the weather in Paris?<|im_end|><|im_assistant|>assistant<|im_middle|>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "failure": "SecurityError",
+   "message": "access to attribute 'append' of 'list' object is unsafe."
+  }
+ ]
+}

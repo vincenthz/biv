@@ -378,6 +378,34 @@ chats, `ChatOptions::draft` at 0 or 1 is faster.
   then split flash attention past 2k positions) have the same top-1 token; over
   4000 tokens they differ by at most 0.06, and by 0.1–0.3 in the next decode
   steps.
+- The precise norms, softplus and decay (c2ea0d3), and the sigmoid with
+  finite scores (0fd9232), measured on an Apple M3 Max on 2026-11-13 from
+  20:14:44 to 20:20:02. The two binaries come from `cargo install --git` of
+  this repository: A at 54d514d (`biv` sha256 c3708561a176a7c1...,
+  `examples/logits` f90b35ec6fc906a1...) and B at 0fd9232 (`biv`
+  4d1592f3db7704ec..., `examples/logits` 87ebb536b8e66986...). Before each
+  run, the GPU rests 20 s and the A command line probes it with the
+  prompt below, until a probe decodes at 50.5 tok/s or more, at most 15
+  probes. All workspace tests pass on Metal at 0fd9232. The command line on
+  Qwen3.8 27B Q4_1 (`--no-think -n 128 --seed 42 -p "Name three prime numbers above
+  100."`) ran in the order A, B, B, A. It gave 50.54, 50.45, 50.95 and
+  50.58 tok/s, so A 50.56 and B 50.70 on average, and all four outputs had
+  the same bytes. The difference is inside the spread of the runs, so the
+  change has no measurable cost on this model. On four small GGUF files
+  with exact one-hot answers (178, 3149, 11194 and 11728 rows), every
+  row of `examples/logits --engine metal` was exact with A and with B, in
+  the same time within 0.6 s.
+- The CPU and Metal greedy answers can differ. On an Apple M3 Max on
+  2026-11-13, the plain command line on Qwen3.8 27B Q4_1 (`--no-think -n 128
+  --seed 42 -p "Name three prime numbers above 100."`) gave the same first
+  78 bytes on both engines, and then the first token of line 7 differed:
+  `### Verification` on the CPU (16 threads, 1 draft) and
+  `**Verification:**` on Metal (4 drafts). The CPU text came from biv
+  0fd9232 and from the CPU math of 1744aa7, with the same bytes, so the
+  CPU math of 1744aa7 is not the cause. The cause is not measured: the
+  Metal logits differ from the CPU logits by the f16 KV cache and the
+  half-precision matmul tiles (see `examples/compare.rs` above), and this
+  token can be a near tie.
 
 ## Performance (M2 Max 38-core GPU, Q4_1)
 

@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "stepfun-ai-Step-3.5-Flash.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nName one more.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS><|im_start|>user\nName a prime number.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions in JSONSchema format:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...>\n...\n</function> block must be nested within <tool_call>\n...\n</tool_call> XML tags\n- Required parameters MUST be specified\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<BOS><|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou have access to the following functions in JSONSchema format:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...>\n...\n</function> block must be nested within <tool_call>\n...\n</tool_call> XML tags\n- Required parameters MUST be specified\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool_response\n<tool_response>{\"temperature\": 18, \"condition\": \"light rain\"}</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "needs_undefined": false
+  }
+ ]
+}

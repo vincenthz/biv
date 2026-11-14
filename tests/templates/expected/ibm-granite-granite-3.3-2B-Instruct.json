@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "ibm-granite-granite-3.3-2B-Instruct.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. Today's Date: January 05, 2026. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. Today's Date: January 05, 2026. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "system_user",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>7<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name one more.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>7<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name one more.<|end_of_text|>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. Today's Date: January 05, 2026. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>7<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name one more.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. Today's Date: January 05, 2026. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>7<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name one more.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. Today's Date: January 05, 2026. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "effort_low",
+   "output": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. Today's Date: January 05, 2026. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "effort_medium",
+   "output": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. Today's Date: January 05, 2026. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. Today's Date: January 05, 2026. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Name a prime number.<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "tools",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.<|end_of_text|>\n<|start_of_role|>available_tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Current weather in a city\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\",\n                        \"description\": \"City name\"\n                    },\n                    \"unit\": {\n                        \"type\": \"string\",\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ]\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    }\n]<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>What is the weather in Paris?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<|start_of_role|>system<|end_of_role|>You are a helpful assistant.<|end_of_text|>\n<|start_of_role|>available_tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Current weather in a city\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"city\": {\n                        \"type\": \"string\",\n                        \"description\": \"City name\"\n                    },\n                    \"unit\": {\n                        \"type\": \"string\",\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ]\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ]\n            }\n        }\n    }\n]<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>What is the weather in Paris?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|><|end_of_text|>\n<|start_of_role|>tool<|end_of_role|>{\"temperature\": 18, \"condition\": \"light rain\"}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "needs_undefined": true
+  }
+ ]
+}

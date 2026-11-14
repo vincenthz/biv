@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "google-gemma-2-2b-it.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n<start_of_turn>model\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "failure": "TemplateError",
+   "message": "System role not supported"
+  },
+  {
+   "case": "two_turns",
+   "failure": "TemplateError",
+   "message": "System role not supported"
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "failure": "TemplateError",
+   "message": "System role not supported"
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n<start_of_turn>model\n7<end_of_turn>\n<start_of_turn>user\nName one more.<end_of_turn>\n<start_of_turn>model\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n<start_of_turn>model\n7<end_of_turn>\n<start_of_turn>user\nName one more.<end_of_turn>\n<start_of_turn>model\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n<start_of_turn>model\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n<start_of_turn>model\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n<start_of_turn>model\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS><start_of_turn>user\nName a prime number.<end_of_turn>\n<start_of_turn>model\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "failure": "TemplateError",
+   "message": "System role not supported"
+  },
+  {
+   "case": "tool_call_and_response",
+   "failure": "TemplateError",
+   "message": "System role not supported"
+  }
+ ]
+}

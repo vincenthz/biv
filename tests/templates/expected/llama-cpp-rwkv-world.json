@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "llama-cpp-rwkv-world.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS>User: Name a prime number.\n\nAssistant: <think>\n</think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS>User: Name a prime number.\n\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS>System: You are a helpful assistant.\n\nUser: Name a prime number.\n\nAssistant: <think>\n</think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS>System: You are a helpful assistant.\n\nUser: Name a prime number.\n\nAssistant: 7\n\nUser: Name one more.\n\nAssistant: <think>\n</think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS>System: You are a helpful assistant.\n\nUser: Name a prime number.\n\nAssistant: 7\n\nUser: Name one more.\n\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS>User: Name a prime number.\n\nAssistant: 7\n\nUser: Name one more.\n\nAssistant: <think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS>User: Name a prime number.\n\nAssistant: 7\n\nUser: Name one more.\n\nAssistant: <think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS>User: Name a prime number.\n\nAssistant: <think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS>User: Name a prime number.\n\nAssistant: <think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS>User: Name a prime number.\n\nAssistant: <think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS>User: Name a prime number.\n\nAssistant: <think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<BOS>System: You are a helpful assistant.\n\nUser: What is the weather in Paris?\n\nAssistant: <think>\n</think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<BOS>System: You are a helpful assistant.\n\nUser: What is the weather in Paris?\n\nAssistant: \n\nAssistant: <think>\n</think>",
+   "needs_undefined": false
+  }
+ ]
+}

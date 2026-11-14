@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "CohereForAI-c4ai-command-r-plus-tool_use.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "system_user",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "two_turns",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "reasoned_answer",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "thinking_on",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "effort_low",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "effort_medium",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "effort_xhigh",
+   "failure": "TypeError",
+   "message": "'NoneType' object is not iterable"
+  },
+  {
+   "case": "tools",
+   "failure": "UndefinedError",
+   "message": "'dict object' has no attribute 'description'"
+  },
+  {
+   "case": "tool_call_and_response",
+   "failure": "UndefinedError",
+   "message": "'dict object' has no attribute 'description'"
+  }
+ ]
+}

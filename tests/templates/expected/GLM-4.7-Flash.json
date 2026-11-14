@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "GLM-4.7-Flash.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "[gMASK]<sop><|user|>Name a prime number.<|assistant|></think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "[gMASK]<sop><|user|>Name a prime number.",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "[gMASK]<sop><|system|>You are a helpful assistant.<|user|>Name a prime number.<|assistant|></think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "[gMASK]<sop><|system|>You are a helpful assistant.<|user|>Name a prime number.<|assistant|></think>7<|user|>Name one more.<|assistant|></think>",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "[gMASK]<sop><|system|>You are a helpful assistant.<|user|>Name a prime number.<|assistant|></think>7<|user|>Name one more.",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "[gMASK]<sop><|user|>Name a prime number.<|assistant|></think>7<|user|>Name one more.<|assistant|><think>",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "[gMASK]<sop><|user|>Name a prime number.<|assistant|></think>7<|user|>Name one more.<|assistant|><think>",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "[gMASK]<sop><|user|>Name a prime number.<|assistant|><think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "[gMASK]<sop><|user|>Name a prime number.<|assistant|><think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "[gMASK]<sop><|user|>Name a prime number.<|assistant|><think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "[gMASK]<sop><|user|>Name a prime number.<|assistant|><think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "[gMASK]<sop><|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>What is the weather in Paris?<|assistant|></think>",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "[gMASK]<sop><|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>You are a helpful assistant.<|user|>What is the weather in Paris?<|assistant|></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>unit</arg_key><arg_value>celsius</arg_value></tool_call><|observation|><tool_response>{\"temperature\": 18, \"condition\": \"light rain\"}</tool_response><|assistant|></think>",
+   "needs_undefined": false
+  }
+ ]
+}

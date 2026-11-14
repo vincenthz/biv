@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "microsoft-Phi-3.5-mini-instruct.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<|user|>\nName a prime number.<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<|user|>\nName a prime number.<|end|>\n<EOS>",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<|system|>\nYou are a helpful assistant.<|end|>\n<|user|>\nName a prime number.<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<|system|>\nYou are a helpful assistant.<|end|>\n<|user|>\nName a prime number.<|end|>\n<|assistant|>\n7<|end|>\n<|user|>\nName one more.<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<|system|>\nYou are a helpful assistant.<|end|>\n<|user|>\nName a prime number.<|end|>\n<|assistant|>\n7<|end|>\n<|user|>\nName one more.<|end|>\n<EOS>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<|user|>\nName a prime number.<|end|>\n<|assistant|>\n7<|end|>\n<|user|>\nName one more.<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<|user|>\nName a prime number.<|end|>\n<|assistant|>\n7<|end|>\n<|user|>\nName one more.<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<|user|>\nName a prime number.<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<|user|>\nName a prime number.<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<|user|>\nName a prime number.<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<|user|>\nName a prime number.<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<|system|>\nYou are a helpful assistant.<|end|>\n<|user|>\nWhat is the weather in Paris?<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<|system|>\nYou are a helpful assistant.<|end|>\n<|user|>\nWhat is the weather in Paris?<|end|>\n<|assistant|>\n<|end|>\n<|assistant|>\n",
+   "needs_undefined": false
+  }
+ ]
+}

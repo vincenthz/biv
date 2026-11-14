@@ -5,6 +5,8 @@ use core::fmt;
 
 use crate::prelude::*;
 use crate::quant::GgmlType;
+use crate::template::json::JsonError;
+use crate::template::{ProbeError, TemplateError, ToolCallForm};
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -62,8 +64,43 @@ pub enum Error {
     },
     /// A snapshot that can't be restored in this session
     Snapshot(&'static str),
+    /// A sampler seed of 0: the caller names the seed
+    ZeroSeed,
+    /// A sampler state of 0, which the random generator never holds
+    ZeroRngState,
+    /// The token mask of the sampler allows no token, so no token can
+    /// come next
+    MaskAllowsNoToken,
+    /// A turn is open: step it to its end or cancel it first
+    TurnOpen,
+    /// No turn is open to step or cancel
+    NoTurn,
     /// A transcript that can't be read, or restored in this chat
     Transcript(&'static str),
+    /// A transcript of version 1, which holds the tokens of a conversation
+    /// but not its messages, so a chat cannot render it
+    TranscriptNoMessages,
+    /// The model file has no chat template (`tokenizer.chat_template`)
+    TemplateMissing,
+    /// The chat template does not load, or fails on a render
+    Template(TemplateError),
+    /// A probe of the chat template gives no clear text
+    Probe(ProbeError),
+    /// A tool of the chat is not JSON
+    ToolDefinition {
+        index: usize,
+        error: JsonError,
+    },
+    /// A chat with tools on a template that writes no tool call
+    ToolsUnsupported,
+    /// A chat with tools on a template whose tool calls have a form that
+    /// Chat does not read
+    ToolCallForm(ToolCallForm),
+    /// A turn with thinking on a template whose generation prompts give no
+    /// special token that ends the reasoning
+    ThinkingUnsupported,
+    /// A reasoning effort whose word the template does not take
+    EffortUnsupported(&'static str),
     /// The GPU backend failed: no device, shader compilation, ...
     Backend(String),
 }
@@ -112,7 +149,36 @@ impl fmt::Display for Error {
                 write!(f, "context full ({n_past} + {prompt} tokens > {context})")
             }
             Error::Snapshot(why) => write!(f, "cannot restore the snapshot: {why}"),
+            Error::ZeroSeed => f.write_str("sampler seed 0: name a seed"),
+            Error::ZeroRngState => f.write_str("sampler state 0: not a state of the generator"),
+            Error::MaskAllowsNoToken => f.write_str("sampler: the token mask allows no token"),
+            Error::TurnOpen => f.write_str("chat: a turn is open"),
+            Error::NoTurn => f.write_str("chat: no turn is open"),
             Error::Transcript(why) => write!(f, "invalid transcript: {why}"),
+            Error::TranscriptNoMessages => {
+                f.write_str("transcript of version 1: it holds no messages to render")
+            }
+            Error::TemplateMissing => f.write_str("the model file has no chat template"),
+            Error::Template(e) => write!(f, "chat template: {e}"),
+            Error::Probe(e) => write!(f, "chat template probe: {e:?}"),
+            Error::ToolDefinition { index, error } => write!(
+                f,
+                "tool {index} is not JSON: {} at byte {}",
+                error.what, error.at
+            ),
+            Error::ToolsUnsupported => f.write_str("the chat template writes no tool call"),
+            Error::ToolCallForm(form) => {
+                write!(f, "chat: no reader for tool calls of the form {form:?}")
+            }
+            Error::ThinkingUnsupported => {
+                f.write_str("the chat template gives no special token that ends the reasoning")
+            }
+            Error::EffortUnsupported(word) => {
+                write!(
+                    f,
+                    "the chat template does not take the reasoning effort {word}"
+                )
+            }
             Error::Backend(msg) => f.write_str(msg),
         }
     }

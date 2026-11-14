@@ -26,7 +26,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::Error;
-use crate::engine::{self, Batch, DraftLogits, Engine, Pass, SeqId, Session, Snapshot, Work};
+use crate::engine::{
+    self, Batch, DraftLogits, Engine, HostTime, Pass, SeqId, Session, Snapshot, Work,
+};
 use crate::memory::{DeviceMemory, ModelMemory, SessionMemory};
 use crate::prelude::*;
 use crate::tokenizer::TokenId;
@@ -41,7 +43,19 @@ pub struct BatchOptions {
     pub logits: usize,
     /// how long a pass waits for the sequences of the previous one
     pub wait: Duration,
+    /// decode rows per pass, at most: the forward and verify tokens of its
+    /// sequences. A draft shrinks so that the busy sequences fit, and a
+    /// pass takes no more, unless one sequence alone needs more.
+    pub decode_rows: usize,
 }
+
+/// The decode rows of a pass of [`BatchOptions::default`]: on Metal, the
+/// most rows that the `mmv` matmul kernels take, above which the `mm`
+/// kernels take a pass and it costs more; elsewhere no limit
+#[cfg(all(feature = "metal", target_os = "macos"))]
+const DEFAULT_DECODE_ROWS: usize = crate::metal::MMV_MAX_ROWS;
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+const DEFAULT_DECODE_ROWS: usize = usize::MAX;
 
 impl Default for BatchOptions {
     fn default() -> Self {
@@ -49,6 +63,7 @@ impl Default for BatchOptions {
             tokens: None,
             logits: 64,
             wait: Duration::from_millis(5),
+            decode_rows: DEFAULT_DECODE_ROWS,
         }
     }
 }
@@ -81,14 +96,33 @@ pub fn serve<R: Send>(
             numerics,
         }),
     };
+    let pass_gpu_time = batch.gpu_time().map(|_| Duration::ZERO);
+    let pass_host_time = batch.host_time().map(|_| HostTime::ZERO);
     Ok(std::thread::scope(|scope| {
         let user = scope.spawn(move || f(handle));
         Scheduler {
             batch: &mut *batch,
             engine,
             wait: opts.wait,
+            decode_rows: opts.decode_rows.max(1),
             queue: Vec::new(),
             answered: Vec::new(),
+            last_pass: Vec::new(),
+            passes: Passes {
+                passes: 0,
+                shared: 0,
+                tokens: 0,
+                sequences: 0,
+                pass_time: Duration::ZERO,
+                pass_gpu_time,
+                pass_host_time,
+                drafts: 0,
+                draft_tokens: 0,
+                draft_time: Duration::ZERO,
+                draft_picks: 0,
+                draft_pick_time: Duration::ZERO,
+                widest_decode: 0,
+            },
         }
         .run(rx);
         user.join()
@@ -102,6 +136,44 @@ pub fn serve<R: Send>(
 pub struct Handle {
     tx: Sender<Request>,
     info: Arc<Info>,
+}
+
+/// The passes a [`serve`] scheduler ran since it started
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Passes {
+    /// all passes
+    pub passes: u64,
+    /// the passes that held the tokens of more than one sequence
+    pub shared: u64,
+    /// the tokens of all passes
+    pub tokens: u64,
+    /// the sequences of all passes, each counted once for each pass that
+    /// holds its tokens: over `passes`, the mean sequences of a pass
+    pub sequences: u64,
+    /// the time of the engine in the passes
+    pub pass_time: Duration,
+    /// the device time of the passes, a part of `pass_time`, or None when
+    /// the engine has no device clock ([`Batch::gpu_time`])
+    pub pass_gpu_time: Option<Duration>,
+    /// the host time of the passes by part, a part of `pass_time`, or None
+    /// when the engine has no command buffers ([`Batch::host_time`]). What
+    /// `pass_time` holds past the parts is the work of a pass before its
+    /// command buffer, and past its readback.
+    pub pass_host_time: Option<HostTime>,
+    /// the drafts that the scheduler served: each one runs for one sequence,
+    /// outside the passes
+    pub drafts: u64,
+    /// the tokens of those drafts
+    pub draft_tokens: u64,
+    /// the time of the engine in those drafts, with the picks of their chats
+    pub draft_time: Duration,
+    /// the picks of those drafts: each one a round trip of the logits of a
+    /// drafted token to its chat and of its pick back
+    pub draft_picks: u64,
+    /// the time of those round trips, a part of `draft_time`
+    pub draft_pick_time: Duration,
+    /// the most decode rows of one pass
+    pub widest_decode: u64,
 }
 
 /// What the handle answers without asking the scheduler
@@ -155,6 +227,9 @@ enum Request {
     DeviceMemory {
         reply: Sender<Option<DeviceMemory>>,
     },
+    Passes {
+        reply: Sender<Passes>,
+    },
     Snapshot {
         seq: SeqId,
         reply: Sender<Result<Snapshot, Error>>,
@@ -188,6 +263,11 @@ impl Handle {
     /// sequences, which their sessions' [`Session::memory`] leaves out
     pub fn shared_memory(&self) -> SessionMemory {
         self.call(|reply| Request::SharedMemory { reply })
+    }
+
+    /// The passes the scheduler ran since it started
+    pub fn passes(&self) -> Passes {
+        self.call(|reply| Request::Passes { reply })
     }
 }
 
@@ -384,10 +464,14 @@ struct Scheduler<'b, 'e> {
     batch: &'b mut (dyn Batch + 'e),
     engine: &'b dyn Engine,
     wait: Duration,
+    decode_rows: usize,
     /// in the order they came
     queue: Vec<Pending>,
     /// the sequences the last pass answered, until they send tokens again
     answered: Vec<SeqId>,
+    /// the sequences of the last pass
+    last_pass: Vec<SeqId>,
+    passes: Passes,
 }
 
 impl Scheduler<'_, '_> {
@@ -446,7 +530,23 @@ impl Scheduler<'_, '_> {
         self.queue.iter().map(Pending::left).sum::<usize>() >= self.batch.max_tokens()
     }
 
+    /// The drafts that `seq` may take, so that the decode rows of the busy
+    /// sequences, each a token and its drafts, fit in `decode_rows`. The
+    /// busy sequences are `seq`, those of the last pass and those that wait.
+    fn draft_room(&self, seq: SeqId) -> usize {
+        let mut busy: Vec<SeqId> = self.queue.iter().map(|p| p.seq).collect();
+        busy.extend(&self.last_pass);
+        busy.push(seq);
+        busy.sort_unstable();
+        busy.dedup();
+        (self.decode_rows / busy.len()).saturating_sub(1)
+    }
+
     fn handle(&mut self, r: Request) {
+        let room = match &r {
+            Request::Draft { seq, .. } => self.draft_room(*seq),
+            _ => 0,
+        };
         let b = &mut *self.batch;
         match r {
             Request::Add {
@@ -489,17 +589,34 @@ impl Scheduler<'_, '_> {
                 reply,
                 picks,
             } => {
+                let n = n.min(room);
+                if n == 0 {
+                    let _ = reply.send(DraftMsg::Done(Vec::new()));
+                    return;
+                }
+                let start = Instant::now();
+                let (mut pick_count, mut pick_time) = (0, Duration::ZERO);
                 let drafts = b.draft(seq, next, n, &mut |l| {
+                    let round_trip = Instant::now();
                     let msg = DraftMsg::Logits {
                         logits: l.logits.to_vec(),
                         tokens: l.tokens.map(<[TokenId]>::to_vec),
                     };
                     // a chat gone takes any token
-                    if reply.send(msg).is_err() {
-                        return 0;
-                    }
-                    picks.recv().unwrap_or(0)
+                    let pick = if reply.send(msg).is_err() {
+                        0
+                    } else {
+                        picks.recv().unwrap_or(0)
+                    };
+                    pick_count += 1;
+                    pick_time += round_trip.elapsed();
+                    pick
                 });
+                self.passes.draft_picks += pick_count;
+                self.passes.draft_pick_time += pick_time;
+                self.passes.drafts += 1;
+                self.passes.draft_tokens += drafts.len() as u64;
+                self.passes.draft_time += start.elapsed();
                 let _ = reply.send(DraftMsg::Done(drafts));
             }
             Request::Keep { seq, n } => b.keep(seq, n),
@@ -519,6 +636,9 @@ impl Scheduler<'_, '_> {
             Request::DeviceMemory { reply } => {
                 let _ = reply.send(self.engine.device_memory());
             }
+            Request::Passes { reply } => {
+                let _ = reply.send(self.passes);
+            }
             Request::Snapshot { seq, reply } => {
                 let _ = reply.send(b.snapshot(seq));
             }
@@ -536,6 +656,7 @@ impl Scheduler<'_, '_> {
     /// batch's tokens and logits
     fn pass(&mut self) {
         let (mut tokens, mut logits) = (self.batch.max_tokens(), self.batch.max_logits());
+        let mut decode_left = self.decode_rows;
         let mut pieces: Vec<Piece> = Vec::new();
         for decode in [true, false] {
             for (i, p) in self.queue.iter().enumerate() {
@@ -546,7 +667,9 @@ impl Scheduler<'_, '_> {
                 let piece = match p.pass {
                     // whole, or not at all; alone, whatever its size
                     Pass::Verify if decode => {
-                        if (left > tokens || left > logits) && !pieces.is_empty() {
+                        if (left > tokens || left > logits || left > decode_left)
+                            && !pieces.is_empty()
+                        {
                             continue;
                         }
                         Piece {
@@ -555,11 +678,18 @@ impl Scheduler<'_, '_> {
                             pass: Pass::Verify,
                         }
                     }
-                    Pass::Forward if decode && left <= tokens && logits > 0 => Piece {
-                        i,
-                        len: left,
-                        pass: Pass::Forward,
-                    },
+                    Pass::Forward
+                        if decode
+                            && left <= tokens
+                            && logits > 0
+                            && (left <= decode_left || pieces.is_empty()) =>
+                    {
+                        Piece {
+                            i,
+                            len: left,
+                            pass: Pass::Forward,
+                        }
+                    }
                     // a prompt, or the start of a long forward
                     Pass::Prefill if !decode => Piece {
                         i,
@@ -574,6 +704,9 @@ impl Scheduler<'_, '_> {
                     _ => continue,
                 };
                 tokens = tokens.saturating_sub(piece.len);
+                if decode {
+                    decode_left = decode_left.saturating_sub(piece.len);
+                }
                 logits = logits.saturating_sub(match piece.pass {
                     Pass::Prefill => 0,
                     Pass::Forward => 1,
@@ -594,7 +727,40 @@ impl Scheduler<'_, '_> {
                 }
             })
             .collect();
+        let start = Instant::now();
+        let gpu_before = self.batch.gpu_time();
+        let host_before = self.batch.host_time();
         let out = self.batch.run(&work);
+        self.passes.pass_time += start.elapsed();
+        if let (Some(total), Some(before), Some(after)) = (
+            self.passes.pass_gpu_time.as_mut(),
+            gpu_before,
+            self.batch.gpu_time(),
+        ) {
+            *total += after - before;
+        }
+        if let (Some(total), Some(before), Some(after)) = (
+            self.passes.pass_host_time.as_mut(),
+            host_before,
+            self.batch.host_time(),
+        ) {
+            *total = total.plus(after.since(before));
+        }
+        // a sequence has at most one request in the queue, so each piece is
+        // the tokens of another sequence
+        self.passes.passes += 1;
+        self.passes.sequences += pieces.len() as u64;
+        let decode_rows: usize = pieces
+            .iter()
+            .filter(|p| p.pass != Pass::Prefill)
+            .map(|p| p.len)
+            .sum();
+        self.passes.widest_decode = self.passes.widest_decode.max(decode_rows as u64);
+        self.last_pass = pieces.iter().map(|p| self.queue[p.i].seq).collect();
+        if pieces.len() > 1 {
+            self.passes.shared += 1;
+        }
+        self.passes.tokens += pieces.iter().map(|p| p.len as u64).sum::<u64>();
 
         let mut finished = Vec::new();
         for (piece, logits) in pieces.iter().zip(out) {

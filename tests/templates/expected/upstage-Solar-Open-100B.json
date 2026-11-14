@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "upstage-Solar-Open-100B.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "system_user",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.\n\n## System Prompt\n\nYou are a helpful assistant.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.\n\n## System Prompt\n\nYou are a helpful assistant.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant<|content|>7<|end|><|begin|>user<|content|>Name one more.<|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.\n\n## System Prompt\n\nYou are a helpful assistant.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant<|content|>7<|end|><|begin|>user<|content|>Name one more.<|end|>",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant<|content|>7<|end|><|begin|>user<|content|>Name one more.<|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant<|content|>7<|end|><|begin|>user<|content|>Name one more.<|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "effort_low",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant<|think|><|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "effort_medium",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.<|end|><|begin|>user<|content|>Name a prime number.<|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "tools",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.\n\n## System Prompt\n\nYou are a helpful assistant.\n\n## Tools\n\n### Tool Call Instruction\nYou may invoke one or more tools to assist with the user's query. Available tools are provided in JSON Schema format: <|tools:begin|><|tool:begin|><tools-json-object><|tool:end|>...<|tools:end|>\n\n### Available Tools\n<|tools:begin|><|tool:begin|>{\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}<|tool:end|><|tools:end|>\n\n### Tool Call Format\nFor each tool call, return a JSON object with the following structure, enclosed within <|tool_call:begin|> and <|tool_call:end|> tags: \n<|tool_call:begin|><tool-call-id><|tool_call:name|><tool-name><|tool_call:args|><args-json-object><|tool_call:end|>\n- The <tool-call-id> must be a randomly generated string consisting of 10 lowercase letters (a-z) and/or digits (0-9) (e.g., a1b2c3d4e5)\n\n### Tool Response Format\nEach tool is responded by `tool` with the following structure:\n<|tool_response:id|><tool-call-id><|tool_response:name|><tool-name><|tool_response:result|><results><|tool_response:end|>\n- Ensure the <tool-call-id> matches the corresponding tool call<|end|><|begin|>user<|content|>What is the weather in Paris?<|end|><|begin|>assistant",
+   "needs_undefined": true
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<|begin|>system<|content|>## Provider System Prompt\n\nYou are Solar Open 100B, a large language model trained by Upstage AI, a Korean startup. Your knowledge cutoff is 2025-07. The current date is 2026-01-05.\n\n## System Prompt\n\nYou are a helpful assistant.\n\n## Tools\n\n### Tool Call Instruction\nYou may invoke one or more tools to assist with the user's query. Available tools are provided in JSON Schema format: <|tools:begin|><|tool:begin|><tools-json-object><|tool:end|>...<|tools:end|>\n\n### Available Tools\n<|tools:begin|><|tool:begin|>{\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}<|tool:end|><|tools:end|>\n\n### Tool Call Format\nFor each tool call, return a JSON object with the following structure, enclosed within <|tool_call:begin|> and <|tool_call:end|> tags: \n<|tool_call:begin|><tool-call-id><|tool_call:name|><tool-name><|tool_call:args|><args-json-object><|tool_call:end|>\n- The <tool-call-id> must be a randomly generated string consisting of 10 lowercase letters (a-z) and/or digits (0-9) (e.g., a1b2c3d4e5)\n\n### Tool Response Format\nEach tool is responded by `tool` with the following structure:\n<|tool_response:id|><tool-call-id><|tool_response:name|><tool-name><|tool_response:result|><results><|tool_response:end|>\n- Ensure the <tool-call-id> matches the corresponding tool call<|end|><|begin|>user<|content|>What is the weather in Paris?<|end|><|begin|>assistant<|tool_calls|><|tool_call:begin|>call_1<|tool_call:name|>get_weather<|tool_call:args|>{\"city\": \"Paris\", \"unit\": \"celsius\"}<|tool_call:end|><|calls|><|begin|>tool<|tool_response|><|tool_response:begin|>call_1<|tool_response:name|>get_weather<|tool_response:result|>{\"temperature\": 18, \"condition\": \"light rain\"}<|tool_response:end|><|end|><|begin|>assistant",
+   "needs_undefined": true
+  }
+ ]
+}

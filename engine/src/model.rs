@@ -17,7 +17,6 @@
 use crate::Error;
 use crate::engine::{DraftLogits, Pass};
 use crate::gguf::{Gguf, TensorInfo, need, tensor};
-#[cfg(not(any(feature = "std", test)))]
 use crate::math::Float;
 use crate::memory::{ModelMemory, SessionMemory, Shape};
 use crate::ops::{self, Input, Weight, matmul_new};
@@ -1071,7 +1070,7 @@ impl<'a> Model<'a> {
                     let kt = &k[t * kd + kh * sd..][..sd];
                     let vt = &v[(t * hv + head) * sd..][..sd];
                     let b = beta[t * hv + head];
-                    let decay = g[t * hv + head].exp();
+                    let decay = Float::exp(g[t * hv + head]);
                     st.iter_mut().for_each(|x| *x *= decay);
                     for (j, dj) in delta.iter_mut().enumerate() {
                         *dj = (vt[j] - quant::dot_f32(&st[j * sd..(j + 1) * sd], kt)) * b;

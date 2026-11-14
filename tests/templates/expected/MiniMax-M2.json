@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "MiniMax-M2.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n7[e~[\n]~b]user\nName one more.[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n7[e~[\n]~b]user\nName one more.[e~[\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n7[e~[\n]~b]user\nName one more.[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n7[e~[\n]~b]user\nName one more.[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.[e~[\n]~b]user\nName a prime number.[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n<tool>{\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}</tool>\n</tools>\n\nWhen making tool calls, use XML format to invoke tools and pass parameters:\n\n<minimax:tool_call>\n<invoke name=\"tool-name-1\">\n<parameter name=\"param-key-1\">param-value-1</parameter>\n<parameter name=\"param-key-2\">param-value-2</parameter>\n...\n</invoke>\n</minimax:tool_call>[e~[\n]~b]user\nWhat is the weather in Paris?[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "]~!b[]~b]system\nYou are a helpful assistant.\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n<tool>{\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}</tool>\n</tools>\n\nWhen making tool calls, use XML format to invoke tools and pass parameters:\n\n<minimax:tool_call>\n<invoke name=\"tool-name-1\">\n<parameter name=\"param-key-1\">param-value-1</parameter>\n<parameter name=\"param-key-2\">param-value-2</parameter>\n...\n</invoke>\n</minimax:tool_call>[e~[\n]~b]user\nWhat is the weather in Paris?[e~[\n]~b]ai\n\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Paris</parameter>\n<parameter name=\"unit\">celsius</parameter>\n</invoke>\n</minimax:tool_call>[e~[\n]~b]tool\n<response>{\"temperature\": 18, \"condition\": \"light rain\"}</response>[e~[\n]~b]ai\n<think>\n",
+   "needs_undefined": true
+  }
+ ]
+}

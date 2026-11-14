@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use biv::chat::{Chat, ChatOptions, Event, ReasoningEffort, TurnStats};
+use biv::chat::{Chat, ChatOptions, Event, ReasoningEffort, Stop, TurnStats};
 use biv::engine::Engine;
 use biv::gguf::Gguf;
 use biv::model::Model;
-use biv::sampler::{Sampler, SamplerConfig};
+use biv::sampler::{Sampler, SamplerConfig, SamplerOverrides};
 use biv::tokenizer::Tokenizer;
 use biv_cli::{bench, fingerprint, hf};
 
@@ -189,7 +189,11 @@ fn print_stats(s: &TurnStats, prompt_time: Duration, gen_time: Duration, style: 
         } else {
             String::new()
         },
-        if s.truncated { " | truncated" } else { "" },
+        if s.stop == Stop::End {
+            ""
+        } else {
+            " | truncated"
+        },
         style.reset()
     );
 }
@@ -333,30 +337,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         engine.description()
     );
 
-    // sampling defaults recommended by the model's publisher
-    let sampling = &gguf.metadata.general.sampling;
-    let defaults = SamplerConfig::default();
-    let sampler_cfg = SamplerConfig {
-        temperature: args.temp.or(sampling.temp).unwrap_or(defaults.temperature),
-        top_k: args
-            .top_k
-            .or(sampling.top_k.map(|v| v as usize))
-            .unwrap_or(defaults.top_k),
-        top_p: args.top_p.or(sampling.top_p).unwrap_or(defaults.top_p),
-        min_p: args.min_p,
-        presence_penalty: args.presence_penalty,
-        repeat_penalty: args.repeat_penalty,
-        // 0: a different seed every run
-        seed: if args.seed != 0 {
-            args.seed
-        } else {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-        },
-        ..defaults
+    // sampling defaults recommended by the model's publisher, under the options
+    let overrides = SamplerOverrides {
+        temperature: args.temp,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        min_p: Some(args.min_p),
+        presence_penalty: Some(args.presence_penalty),
+        repeat_penalty: Some(args.repeat_penalty),
     };
+    // no --seed: a different seed every run
+    let seed = if args.seed != 0 {
+        args.seed
+    } else {
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64
+    };
+    let sampler_cfg = SamplerConfig::from_gguf(&gguf, overrides, seed)?;
     let mut opts = args.opts.clone();
     opts.context = opts.context.min(model.cfg.context_length);
     if let Some(check) = &args.fingerprint {
@@ -422,6 +418,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             |ev| {
                 match ev {
                     Event::PromptDone => t1 = Some(Instant::now()),
+                    // the text events show the answer
+                    Event::Token(_) => {}
                     Event::Thinking(t) => {
                         if !in_think {
                             in_think = true;

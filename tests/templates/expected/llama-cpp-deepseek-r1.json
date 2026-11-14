@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "llama-cpp-deepseek-r1.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<BOS><｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜><think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<BOS><｜User｜>Name a prime number.<｜end▁of▁sentence｜>",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<BOS>You are a helpful assistant.<｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜><think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<BOS>You are a helpful assistant.<｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜end▁of▁sentence｜><｜Assistant｜><think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<BOS>You are a helpful assistant.<｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜end▁of▁sentence｜>",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<BOS><｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜end▁of▁sentence｜><｜Assistant｜><think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<BOS><｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜>7<｜end▁of▁sentence｜><｜User｜>Name one more.<｜end▁of▁sentence｜><｜Assistant｜><think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "thinking_on",
+   "output": "<BOS><｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜><think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<BOS><｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜><think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<BOS><｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜><think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<BOS><｜User｜>Name a prime number.<｜end▁of▁sentence｜><｜Assistant｜><think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "failure": "TypeError",
+   "message": "Object of type generator is not JSON serializable"
+  },
+  {
+   "case": "tool_call_and_response",
+   "failure": "TypeError",
+   "message": "Object of type generator is not JSON serializable"
+  }
+ ]
+}

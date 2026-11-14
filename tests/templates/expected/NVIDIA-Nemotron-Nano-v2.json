@@ -1,0 +1,77 @@
+{
+ "header": {
+  "template": "NVIDIA-Nemotron-Nano-v2.jinja",
+  "jinja2": "3.1.6",
+  "transformers": "5.5.2",
+  "llama_cpp_commit": "ad2775726",
+  "fixed_date": "2026-01-05",
+  "renderer": "transformers render_jinja_template"
+ },
+ "cases": [
+  {
+   "case": "user",
+   "output": "<SPECIAL_10>System\n\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "user_no_generation_prompt",
+   "output": "<SPECIAL_10>System\n\n\n<SPECIAL_11>User\nName a prime number.\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "system_user",
+   "output": "<SPECIAL_10>System\nYou are a helpful assistant.\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "two_turns",
+   "output": "<SPECIAL_10>System\nYou are a helpful assistant.\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n7\n<SPECIAL_12>\n<SPECIAL_11>User\nName one more.\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "two_turns_no_generation_prompt",
+   "output": "<SPECIAL_10>System\nYou are a helpful assistant.\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n7\n<SPECIAL_12>\n<SPECIAL_11>User\nName one more.\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer",
+   "output": "<SPECIAL_10>System\n\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n7\n<SPECIAL_12>\n<SPECIAL_11>User\nName one more.\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "reasoned_answer_not_preserved",
+   "output": "<SPECIAL_10>System\n\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n7\n<SPECIAL_12>\n<SPECIAL_11>User\nName one more.\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": true
+  },
+  {
+   "case": "thinking_on",
+   "output": "<SPECIAL_10>System\n\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_low",
+   "output": "<SPECIAL_10>System\n\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_medium",
+   "output": "<SPECIAL_10>System\n\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "effort_xhigh",
+   "output": "<SPECIAL_10>System\n\n\n<SPECIAL_11>User\nName a prime number.\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tools",
+   "output": "<SPECIAL_10>System\nYou are a helpful assistant.\n\nYou can use the following tools to assist the user if required:\n<AVAILABLE_TOOLS>[{\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}]</AVAILABLE_TOOLS>\n\nIf you decide to call any tool(s), use the following format:\n<TOOLCALL>[{{\"name\": \"tool_name1\", \"arguments\": \"tool_args1\"}}, {{\"name\": \"tool_name2\", \"arguments\": \"tool_args2\"}}]</TOOLCALL>\n\nThe user will execute tool-calls and return responses from tool(s) in this format:\n<TOOL_RESPONSE>[{{\"tool_response1\"}}, {{\"tool_response2\"}}]</TOOL_RESPONSE>\n\nBased on the tool responses, you can call additional tools if needed, correct tool calls if any errors are found, or just respond to the user.\n\n<SPECIAL_11>User\nWhat is the weather in Paris?\n<SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": false
+  },
+  {
+   "case": "tool_call_and_response",
+   "output": "<SPECIAL_10>System\nYou are a helpful assistant.\n\nYou can use the following tools to assist the user if required:\n<AVAILABLE_TOOLS>[{\"name\": \"get_weather\", \"description\": \"Current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}]</AVAILABLE_TOOLS>\n\nIf you decide to call any tool(s), use the following format:\n<TOOLCALL>[{{\"name\": \"tool_name1\", \"arguments\": \"tool_args1\"}}, {{\"name\": \"tool_name2\", \"arguments\": \"tool_args2\"}}]</TOOLCALL>\n\nThe user will execute tool-calls and return responses from tool(s) in this format:\n<TOOL_RESPONSE>[{{\"tool_response1\"}}, {{\"tool_response2\"}}]</TOOL_RESPONSE>\n\nBased on the tool responses, you can call additional tools if needed, correct tool calls if any errors are found, or just respond to the user.\n\n<SPECIAL_11>User\nWhat is the weather in Paris?\n<SPECIAL_11>Assistant\n<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"unit\": \"celsius\"}}]</TOOLCALL>\n<SPECIAL_12>\n<SPECIAL_11>User\n<TOOL_RESPONSE>[{\"temperature\": 18, \"condition\": \"light rain\"}]</TOOL_RESPONSE><SPECIAL_11>Assistant\n<think>\n",
+   "needs_undefined": false
+  }
+ ]
+}

@@ -16,6 +16,7 @@
 //! and nothing after them.
 
 use crate::Error;
+use crate::conversation::Conversation;
 use crate::prelude::*;
 use crate::tokenizer::TokenId;
 
@@ -26,10 +27,13 @@ const HEADER: usize = 20;
 /// The compact encoding's escape, and the id it adds to the u32 after it
 const ESCAPE: u16 = 0xffff;
 
-/// A conversation up to some point as token ids alone, see
+/// A conversation up to some point as token ids and its messages, see
 /// [`crate::chat::Chat::transcript`]: a few bytes per token, but restoring it
-/// processes the tokens again
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// processes the tokens again. Version 2 carries the messages of the
+/// conversation so that a chat can render them; version 1 (from bytes of
+/// an earlier format) has no messages, and restoring it fails with
+/// [`Error::TranscriptNoMessages`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcript {
     /// every token of the conversation, in order: the system block, the
     /// messages and the answers, as the chat template writes them
@@ -39,6 +43,9 @@ pub struct Transcript {
     pub pending: usize,
     /// the tokens the model generated, for the sampler's penalties
     pub generated: Vec<TokenId>,
+    /// the messages of the conversation, for the chat to render: `None` in
+    /// a version 1 transcript (from bytes), which a chat refuses
+    pub conversation: Option<Conversation>,
 }
 
 impl Transcript {
@@ -108,6 +115,7 @@ impl Transcript {
             tokens,
             pending,
             generated,
+            conversation: None,
         })
     }
 }
@@ -276,6 +284,7 @@ mod tests {
             tokens: IDS.to_vec(),
             pending: 2,
             generated: vec![0xffff, 7, 248_000],
+            conversation: None,
         };
         for encoding in [TokenEncoding::Full, TokenEncoding::Compact] {
             let bytes = t.to_bytes(encoding);
@@ -292,7 +301,12 @@ mod tests {
             longer.push(0);
             assert!(Transcript::from_bytes(&longer).is_err());
         }
-        let empty = Transcript::default();
+        let empty = Transcript {
+            tokens: Vec::new(),
+            pending: 0,
+            generated: Vec::new(),
+            conversation: None,
+        };
         assert_eq!(
             Transcript::from_bytes(&empty.to_bytes(TokenEncoding::Compact)).unwrap(),
             empty
@@ -305,6 +319,7 @@ mod tests {
             tokens: vec![1, 2, 3],
             pending: 1,
             generated: vec![3],
+            conversation: None,
         }
         .to_bytes(TokenEncoding::Full);
         let with = |i: usize, v: u8| {

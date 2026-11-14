@@ -1,6 +1,8 @@
-//! The f32 functions core lacks, from libm without `std`. With `std` (and in
-//! tests, which link std) the inherent methods are used and this trait is not
-//! imported.
+//! The f32 functions core lacks, from libm. `exp` and `ln_1p` come from libm
+//! on every build: the call sites name this trait, so a build with `std`
+//! computes the same values as one without, and a bound proved for libm holds
+//! for each build. The other functions come from libm without `std` only. With
+//! `std` (and in tests, which link std) their inherent methods are used.
 
 #![cfg_attr(any(feature = "std", test), allow(dead_code))]
 
