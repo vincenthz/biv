@@ -10,9 +10,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLLibrary, MTLResourceOptions,
+    MTLSize,
 };
 
 use crate::Error;
@@ -27,6 +28,24 @@ use crate::quant::GgmlType;
 use crate::tokenizer::TokenId;
 
 const SOURCE: &str = include_str!("kernels.metal");
+
+/// Where the dispatches being encoded on this thread are, between
+/// [`MetalEngine::concurrent`] groups. The encoders are concurrent: a
+/// dispatch waits for the ones before it only behind a barrier, which every
+/// dispatch has but those of a group after its first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// not in a group
+    None,
+    /// before the first dispatch of a group
+    First,
+    /// after it
+    In,
+}
+
+std::thread_local! {
+    static GROUP: core::cell::Cell<Group> = const { core::cell::Cell::new(Group::None) };
+}
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
@@ -56,8 +75,17 @@ const MMV_WEIGHT_ROWS: usize = 16;
 /// one too when it has this many pairs or more; the others by `mmv_id` in
 /// tiles of 8. On an M2 Max, prefill of Qwen3.6 35B-A3B in passes of 256
 /// tokens: 902 tok/s from 33 (no partial tile of 32), 937 from 12 to 16,
-/// 931 from 8.
+/// 931 from 8; in passes of 512, 1083 tok/s from 1, 1141 from 4, 1170 from 8,
+/// 1174 from 16.
 const MM_ID_MIN: usize = 16;
+/// Passes of up to this many tokens multiply each of their pairs by its
+/// expert with the `mv_id` kernels, a threadgroup row per pair, rather than
+/// sorting them into tiles: in a decode step an expert has one pair, which
+/// the 8 columns of an `mmv_id` tile would compute 8 times. Longer passes have
+/// more tokens on the same experts, whose weights a tile reads once (Qwen3.6
+/// 35B-A3B on an M2 Max, decode with 1 draft / 4 drafts: 83 / 87 tok/s up to 2,
+/// 80 / 86 up to 3, 79 / 80 up to 8).
+const MV_ID_MAX_ROWS: usize = 2;
 
 /// Attention positions per split-K range, at least
 const ATTN_CHUNK: usize = 32;
@@ -243,6 +271,7 @@ kernels! {
     |hd, group|
     MvQ4_0 => "mv_q4_0",
     MvQ4_1 => "mv_q4_1",
+    MvQ8_0 => "mv_q8_0",
     MvQ5K => "mv_q5_K",
     MvQ6K => "mv_q6_K",
     MvF32 => "mv_f32",
@@ -278,6 +307,14 @@ kernels! {
     AttnFlashSplit => format!("attn_flash_split_{hd}"),
     SsmConv => "ssm_conv",
     Gdn128 => "gdn_128",
+    MvIdQ4_0 => "mv_id_q4_0",
+    MvIdQ4_1 => "mv_id_q4_1",
+    MvIdQ8_0 => "mv_id_q8_0",
+    MvIdQ5K => "mv_id_q5_K",
+    MvIdQ6K => "mv_id_q6_K",
+    MvIdF32 => "mv_id_f32",
+    MvIdF16 => "mv_id_f16",
+    MvIdBf16 => "mv_id_bf16",
     MmvIdF32 => "mmv_id_f32",
     MmvIdF16 => "mmv_id_f16",
     MmvIdBf16 => "mmv_id_bf16",
@@ -297,6 +334,7 @@ kernels! {
     MmIdQ5K => "mm_id_q5_K",
     MmIdQ6K => "mm_id_q6_K",
     MoeRoute => "moe_route",
+    MoeRank => "moe_rank",
     MoeSort => "moe_sort",
     MoeCombine => "moe_combine",
 }
@@ -317,6 +355,7 @@ fn mv_kernel(ty: GgmlType) -> Option<(Kernel, usize, usize)> {
     Some(match ty {
         GgmlType::Q4_0 => (Kernel::MvQ4_0, 8, 64),
         GgmlType::Q4_1 => (Kernel::MvQ4_1, 8, 64),
+        GgmlType::Q8_0 => (Kernel::MvQ8_0, 2, 128),
         GgmlType::Q5K => (Kernel::MvQ5K, 2, 64),
         GgmlType::Q6K => (Kernel::MvQ6K, 4, 64),
         GgmlType::F32 => (Kernel::MvF32, 4, 128),
@@ -324,6 +363,24 @@ fn mv_kernel(ty: GgmlType) -> Option<(Kernel, usize, usize)> {
         GgmlType::BF16 => (Kernel::MvBf16, 4, 128),
         _ => return None,
     })
+}
+
+/// The `mv_id` kernels, of the same geometry as [`mv_kernel`]'s: a pair of
+/// the experts' products per threadgroup row
+fn mv_id_kernel(ty: GgmlType) -> Option<(Kernel, usize, usize)> {
+    let (_, rows, threads) = mv_kernel(ty)?;
+    let k = match ty {
+        GgmlType::Q4_0 => Kernel::MvIdQ4_0,
+        GgmlType::Q4_1 => Kernel::MvIdQ4_1,
+        GgmlType::Q8_0 => Kernel::MvIdQ8_0,
+        GgmlType::Q5K => Kernel::MvIdQ5K,
+        GgmlType::Q6K => Kernel::MvIdQ6K,
+        GgmlType::F32 => Kernel::MvIdF32,
+        GgmlType::F16 => Kernel::MvIdF16,
+        GgmlType::BF16 => Kernel::MvIdBf16,
+        _ => return None,
+    };
+    Some((k, rows, threads))
 }
 
 /// The `mmv` kernels, for 4 to 16 input rows
@@ -706,7 +763,31 @@ impl<'m> MetalEngine<'m> {
             height: v[1],
             depth: v[2],
         };
+        let barrier = GROUP.with(|g| match g.get() {
+            Group::None => true,
+            Group::First => {
+                g.set(Group::In);
+                true
+            }
+            Group::In => false,
+        });
+        if barrier {
+            enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(size(grid), size(threads));
+    }
+
+    /// Encode the dispatches of `f` to run concurrently: they wait for the
+    /// dispatches before them, not for each other, so none may read what
+    /// another writes, nor two write the same bytes
+    fn concurrent<R>(&self, f: impl FnOnce() -> R) -> R {
+        GROUP.with(|g| {
+            assert!(g.get() == Group::None, "nested concurrent groups");
+            g.set(Group::First);
+        });
+        let r = f();
+        GROUP.with(|g| g.set(Group::None));
+        r
     }
 
     fn args<T>(enc: &Encoder, args: &T) {
@@ -979,6 +1060,8 @@ struct MoeScratch {
     out: Buffer,
     /// the shared expert's gate, per token
     gate: Buffer,
+    /// rank of each pair among its expert's, then the pairs of each expert
+    rank: Buffer,
 }
 
 /// The MTP head's input rows of a pass
@@ -1092,7 +1175,7 @@ fn scratch_bytes(c: &Config, b: usize, logit_rows: usize) -> [usize; 16] {
 
 /// Bytes of the buffers of [`MoeScratch`], in the order of its fields, for
 /// passes of `b` tokens
-fn moe_bytes(c: &Config, b: usize) -> Option<[usize; 8]> {
+fn moe_bytes(c: &Config, b: usize) -> Option<[usize; 9]> {
     let m = c.moe.as_ref()?;
     let pairs = b * m.n_expert_used;
     Some([
@@ -1107,6 +1190,7 @@ fn moe_bytes(c: &Config, b: usize) -> Option<[usize; 8]> {
         8,
         4 * pairs * c.n_embd,
         4 * b,
+        4 * (pairs + m.n_expert),
     ])
 }
 
@@ -1253,7 +1337,7 @@ impl Scratch {
             feat: a.zeroed(feat)?,
             logits: a.zeroed(logits)?,
             moe: match moe_bytes(c, b) {
-                Some([logits, ids, weights, order, tiles, n_tiles, out, gate]) => {
+                Some([logits, ids, weights, order, tiles, n_tiles, out, gate, rank]) => {
                     Some(MoeScratch {
                         logits: a.zeroed(logits)?,
                         ids: a.zeroed(ids)?,
@@ -1263,6 +1347,7 @@ impl Scratch {
                         n_tiles: a.zeroed(n_tiles)?,
                         out: a.zeroed(out)?,
                         gate: a.zeroed(gate)?,
+                        rank: a.zeroed(rank)?,
                     })
                 }
                 None => None,
@@ -1526,7 +1611,7 @@ impl MetalEngine<'_> {
             .commandBuffer()
             .expect("metal: no command buffer");
         let enc = cb
-            .computeCommandEncoder()
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
             .expect("metal: no compute encoder");
         encode(&enc);
         enc.endEncoding();
@@ -1899,10 +1984,12 @@ impl MetalEngine<'_> {
             } => {
                 let (sd, hk, hv) = (c.ssm_state, c.ssm_k_heads, c.ssm_v_heads);
                 let conv_dim = c.conv_dim();
-                self.matmul(enc, wqkv, h, n, B::at(&s.a1));
-                self.matmul(enc, wgate, h, n, B::at(&s.a2));
-                self.matmul(enc, wbeta, h, n, B::at(&s.beta));
-                self.matmul(enc, walpha, h, n, B::at(&s.alpha));
+                self.concurrent(|| {
+                    self.matmul(enc, wqkv, h, n, B::at(&s.a1));
+                    self.matmul(enc, wgate, h, n, B::at(&s.a2));
+                    self.matmul(enc, wbeta, h, n, B::at(&s.beta));
+                    self.matmul(enc, walpha, h, n, B::at(&s.alpha));
+                });
 
                 for g in segs {
                     let LayerState::DeltaNet { conv, s: st } = g.ls else {
@@ -1983,9 +2070,11 @@ impl MetalEngine<'_> {
                 q_norm,
                 k_norm,
             } => {
-                self.matmul(enc, wq, h, n, B::at(&s.a1));
-                self.matmul(enc, wk, h, n, B::at(&s.k));
-                self.matmul(enc, wv, h, n, B::at(&s.v));
+                self.concurrent(|| {
+                    self.matmul(enc, wq, h, n, B::at(&s.a1));
+                    self.matmul(enc, wk, h, n, B::at(&s.k));
+                    self.matmul(enc, wv, h, n, B::at(&s.v));
+                });
 
                 let (qd, kv_dim) = (c.n_head * hd, c.n_head_kv * hd);
                 let group = c.n_head / c.n_head_kv;
@@ -2123,8 +2212,10 @@ impl MetalEngine<'_> {
         out: B<'_>,
     ) {
         let h = B::at(&s.h);
-        self.matmul(enc, gate, h, n, B::at(&s.a1));
-        self.matmul(enc, up, h, n, B::at(&s.a2));
+        self.concurrent(|| {
+            self.matmul(enc, gate, h, n, B::at(&s.a1));
+            self.matmul(enc, up, h, n, B::at(&s.a2));
+        });
         self.elementwise(
             enc,
             Kernel::Swiglu,
@@ -2154,11 +2245,17 @@ impl MetalEngine<'_> {
 
         // the shared expert first: the experts then take `a1` and `a2`
         if let Some([sg, su, sd, gate_inp]) = shared {
-            self.encode_dense_ffn(enc, s, sg, su, sd, n, B::at(&s.y));
-            self.matmul(enc, gate_inp, h, n, B::at(&m.gate));
+            self.concurrent(|| {
+                self.matmul(enc, sg, h, n, B::at(&s.a1));
+                self.matmul(enc, su, h, n, B::at(&s.a2));
+                self.matmul(enc, gate_inp, h, n, B::at(&m.gate));
+                self.matmul(enc, router, h, n, B::at(&m.logits));
+            });
+            self.elementwise(enc, Kernel::Swiglu, B::at(&s.a1), B::at(&s.a2), n * sg.rows);
+            self.matmul(enc, sd, B::at(&s.a1), n, B::at(&s.y));
+        } else {
+            self.matmul(enc, router, h, n, B::at(&m.logits));
         }
-
-        self.matmul(enc, router, h, n, B::at(&m.logits));
         let (mm_tiles, mv_tiles) = max_tiles(c, n, MM_ID_MIN);
         MetalEngine::args(
             enc,
@@ -2170,25 +2267,39 @@ impl MetalEngine<'_> {
         MetalEngine::bind(enc, &[B::at(&m.logits), B::at(&m.ids), B::at(&m.weights)]);
         self.dispatch(enc, Kernel::MoeRoute, [n, 1, 1], [256, 1, 1], 4 * ne);
 
-        MetalEngine::args(
-            enc,
-            &SortArgs {
+        // a matvec per pair, when every type of the experts has one
+        let per_pair = n <= MV_ID_MAX_ROWS
+            && [gate, up, down]
+                .iter()
+                .all(|w| mv_id_kernel(w.ty).is_some());
+
+        if !per_pair {
+            let args = SortArgs {
                 n_pairs: (n * k) as i32,
                 n_expert: ne as i32,
                 mm_min: MM_ID_MIN as i32,
                 mv_base: mm_tiles as i32,
-            },
-        );
-        MetalEngine::bind(
-            enc,
-            &[
-                B::at(&m.ids),
-                B::at(&m.order),
-                B::at(&m.tiles),
-                B::at(&m.n_tiles),
-            ],
-        );
-        self.dispatch(enc, Kernel::MoeSort, [1, 1, 1], [256, 1, 1], 4 * 4 * ne);
+            };
+            // the ranks and counts, a threadgroup per expert
+            let (rank, count) = (B::at(&m.rank), B(&m.rank, 4 * n * k));
+            MetalEngine::args(enc, &args);
+            MetalEngine::bind(enc, &[B::at(&m.ids), rank, count]);
+            self.dispatch(enc, Kernel::MoeRank, [ne, 1, 1], [256, 1, 1], 4 * 8);
+            // then the pairs in order and the tiles
+            MetalEngine::args(enc, &args);
+            MetalEngine::bind(
+                enc,
+                &[
+                    B::at(&m.ids),
+                    B::at(&m.order),
+                    B::at(&m.tiles),
+                    B::at(&m.n_tiles),
+                    rank,
+                    count,
+                ],
+            );
+            self.dispatch(enc, Kernel::MoeSort, [1, 1, 1], [256, 1, 1], 4 * 4 * ne);
+        }
 
         let matmul = |w: &GpuExperts, x: B<'_>, x_div: usize, out: B<'_>| {
             MetalEngine::args(
@@ -2204,6 +2315,18 @@ impl MetalEngine<'_> {
                 },
             );
             let wb = B(&w.buf, w.offset);
+            if per_pair {
+                let (kernel, rows_per_tg, threads) = mv_id_kernel(w.ty).expect("checked above");
+                MetalEngine::bind(enc, &[wb, x, out, B::at(&m.ids)]);
+                self.dispatch(
+                    enc,
+                    kernel,
+                    [w.rows.div_ceil(rows_per_tg), n * k, 1],
+                    [threads, 1, 1],
+                    0,
+                );
+                return;
+            }
             // an expert has at most a pair per token
             if n >= MM_ID_MIN {
                 let (tiles, n_tiles) = (B::at(&m.tiles), B::at(&m.n_tiles));
@@ -2226,9 +2349,12 @@ impl MetalEngine<'_> {
                 0,
             );
         };
-        // a token's row for each of its pairs, then a row per pair
-        matmul(gate, h, k, B::at(&s.a1));
-        matmul(up, h, k, B::at(&s.a2));
+        // a token's row for each of its pairs, then a row per pair; the
+        // `mm_id` and `mmv_id` tiles of a matrix are disjoint pairs
+        self.concurrent(|| {
+            matmul(gate, h, k, B::at(&s.a1));
+            matmul(up, h, k, B::at(&s.a2));
+        });
         self.elementwise(
             enc,
             Kernel::Swiglu,
@@ -2236,7 +2362,7 @@ impl MetalEngine<'_> {
             B::at(&s.a2),
             n * k * gate.rows,
         );
-        matmul(down, B::at(&s.a1), 1, B::at(&m.out));
+        self.concurrent(|| matmul(down, B::at(&s.a1), 1, B::at(&m.out)));
 
         MetalEngine::args(
             enc,

@@ -44,7 +44,7 @@ The kernels cover F32, F16, BF16, Q4_0, Q4_1, Q8_0, Q4_K, Q5_K and Q6_K; files
 with other types (IQ*, Q2_K, Q3_K, Q5_0, Q5_1) don't load.
 
 Qwen3.5 dense models have the same architecture. Qwen3.5 4B runs on Metal and the
-CPU, at about 45 tokens/s on an M2 Max (Q8_0):
+CPU, at about 67 tokens/s on an M2 Max (Q8_0):
 
 ```sh
 hf download unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-Q8_0.gguf     # 4.5 GB
@@ -54,8 +54,8 @@ hf download unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-Q8_0.gguf     # 4.5 GB
 Its GGUF has no MTP head, so it decodes without drafting (`--lookup` still works).
 
 The mixture-of-experts models (`qwen35moe`: 256 experts, 8 per token, plus a shared
-expert) also run on both backends. Qwen3.6 35B-A3B (Q8_0) decodes at about 45
-tokens/s on an M2 Max, and 60 to 90 with its MTP head drafting:
+expert) also run on both backends. Qwen3.6 35B-A3B (Q8_0) decodes at about 66
+tokens/s on an M2 Max, and 85 to 120 with its MTP head drafting:
 
 ```sh
 hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-Q8_0.gguf   # 37.8 GB
@@ -125,7 +125,7 @@ Metal logits differ by up to about 0.4 on this probe.
 `biv bench [options] [--exact]` measures greedy decode with 0, 1 and 4 MTP
 drafts per step, and 1 then 4 chats sharing passes ([batching](#batching)). It
 takes the chat's `-m`, `--cpu`, `-t` and `-b`, and runs in 45s for the 27B on an
-M2 Max (18s for the 35B-A3B). `--exact` takes more answers, 0 to 6 drafts, a
+M2 Max (14s for the 35B-A3B). `--exact` takes more answers, 0 to 6 drafts, a
 sampled row (temperature 1, seed 1), and 1 to 8 chats with 0 or 1 draft, in under
 3 minutes. The rows give the decode rate and the speedup over the first row;
 with drafts, the share of drafts kept and the tokens per step; with chats, the
@@ -140,21 +140,21 @@ so `same answers` only counts them.
 $ biv bench --exact
 exact: 3 prompts x 128 tokens, greedy
 drafts          decode  speedup  accepted  tok/step  same text
-0           18.4 tok/s    1.00x         -      1.00  -
-1           26.5 tok/s    1.44x       86%      1.85  3/3
-2           24.9 tok/s    1.35x       75%      2.48  3/3
-4           28.5 tok/s    1.54x       56%      3.20  3/3
-6           28.2 tok/s    1.53x       43%      3.49  3/3
-4 sampled   26.8 tok/s    1.45x       51%      3.00  -
+0           19.1 tok/s    1.00x         -      1.00  -
+1           26.8 tok/s    1.41x       86%      1.85  3/3
+2           24.2 tok/s    1.27x       75%      2.48  3/3
+4           28.8 tok/s    1.51x       56%      3.20  3/3
+6           28.0 tok/s    1.47x       43%      3.49  3/3
+4 sampled   26.9 tok/s    1.41x       51%      3.00  -
 
 batching: 8 prompts x 40 tokens, greedy, each chat taking the next prompt when done
 chats  drafts         tok/s  speedup  same answers
-    1       0    16.1 tok/s    1.00x  -
-    2       0    24.6 tok/s    1.53x  8/8
-    4       0    32.9 tok/s    2.04x  8/8
-    8       0    53.1 tok/s    3.30x  8/8
-    4       1    37.9 tok/s    2.36x  8/8
-    8       1    43.4 tok/s    2.70x  8/8
+    1       0    16.7 tok/s    1.00x  -
+    2       0    24.8 tok/s    1.48x  8/8
+    4       0    34.4 tok/s    2.06x  8/8
+    8       0    54.5 tok/s    3.25x  8/8
+    4       1    39.5 tok/s    2.36x  8/8
+    8       1    44.6 tok/s    2.67x  8/8
 ```
 
 A row is one run, so rates move by a few percent between runs (more when the
@@ -188,8 +188,8 @@ time either way (cpuid). Its features:
 | `engine/src/memory.rs` | memory of a model and its sessions: estimated from the GGUF alone (`Footprint`), or reported by engines and sessions |
 | `engine/src/engine.rs` | `Engine` / `Session` / `Batch` traits shared by the backends (draft / verify / keep for speculative decoding); CPU implementation; sequential batches |
 | `engine/src/batch.rs` | continuous batching: the scheduler, and the `Engine` handle whose sessions it serves |
-| `engine/src/metal/mod.rs` | Metal backend: no-copy weight buffers, per-sequence KV/recurrent state, one command buffer per forward pass of one or more sequences |
-| `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels, expert routing and the matmul / matvec over each expert's tokens |
+| `engine/src/metal/mod.rs` | Metal backend: no-copy weight buffers, per-sequence KV/recurrent state, one command buffer per forward pass of one or more sequences, on a concurrent encoder |
+| `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels, expert routing and sorting, the matmul / matvec over each expert's tokens, and the matvec per (token, expert) pair of decode steps |
 | `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35` pre-tokenizer regex, matched by hand |
 | `engine/src/chat.rs` | chat template (ChatML with `<think>`), incremental multi-turn state, the speculative decoding loop |
 | `engine/src/transcript.rs` | a conversation as token ids, and its bytes |
@@ -303,11 +303,14 @@ batched pass yet: its batch runs the sequences one after another.
 
 A sequence's logits depend on the other tokens of its passes, as on how
 a prompt is split: the matmul kernels are chosen by the rows of the whole
-pass. On Qwen3.6 35B-A3B (Q8_0), decode steps of 2 to 8 sequences of one
-token each gave the logits of each alone, bit for bit; a prompt piece in a pass
-with other sequences' tokens doesn't. On the dense models the 8 answers below were the
-same text as alone. On Qwen3.6 35B-A3B 5 of 8 parted after a few hundred
-characters, the experts' router turning small differences into other experts.
+pass. Decode steps of 2 sequences of one token each give the logits of each
+alone, bit for bit: up to 3 rows the dense matmuls run a matvec per row, and
+up to 2 the experts' products one per (token, expert) pair. With more
+sequences, or a prompt piece in a pass with other sequences' tokens, the logits
+differ by rounding (Qwen3.6 35B-A3B, decode steps of 3 to 8 sequences: up to
+7e-4). On the dense models the 8 answers below were the same text as alone. On
+Qwen3.6 35B-A3B 5 of 8 parted after a few hundred characters, the experts'
+router turning small differences into other experts.
 
 Throughput of 8 greedy answers of 128 tokens without thinking, `j` chats at a
 time, each taking the next prompt when done (`examples/batch.rs`, M2 Max), in
@@ -315,12 +318,12 @@ tokens per second for all the chats together:
 
 | | alone | 2 chats | 4 chats | 8 chats |
 |---|---|---|---|---|
-| Qwen3.5 4B Q8_0 | 43.9 | 81.4 | 145.0 | 242.5 (5.5×) |
-| Qwen3.8 27B Q4_1, no draft | 17.4 | 24.4 | 35.8 | 61.9 (3.6×) |
-| Qwen3.8 27B Q4_1, 1 draft | 21.8 | | 49.4 | 54.4 |
-| Qwen3.8 27B Q4_1, 4 drafts | 23.0 | 26.1 | 31.8 | 36.3 |
-| Qwen3.6 35B-A3B Q8_0, no draft | 43.0 | | 104.3 | 143.4 (3.3×) |
-| Qwen3.6 35B-A3B Q8_0, 4 drafts | 59.2 | | | 91.1 |
+| Qwen3.5 4B Q8_0 | 64.3 | 99.1 | 159.3 | 256.5 (4.0×) |
+| Qwen3.8 27B Q4_1, no draft | 18.1 | 28.1 | 39.8 | 67.2 (3.7×) |
+| Qwen3.8 27B Q4_1, 1 draft | 24.4 | | 54.1 | 58.8 |
+| Qwen3.8 27B Q4_1, 4 drafts | 25.3 | 27.9 | 35.0 | 39.2 |
+| Qwen3.6 35B-A3B Q8_0, no draft | 63.6 | | 117.4 | 156.0 (2.5×) |
+| Qwen3.6 35B-A3B Q8_0, 4 drafts | 68.8 | | | 108.9 |
 
 Drafting gains less in a batch: 8 verify passes of 5 tokens make 40 rows, in
 the `mm` kernels, and each chat's drafts are passes of their own. With many
@@ -371,8 +374,8 @@ chats, `ChatOptions::draft` at 0 or 1 is faster.
   sequences run in one pass have the top-1 token they have alone; a prefix
   saved and restored through the scheduler gives the answer of the engine
   itself; then the throughput above, and how many answers are the text of the
-  same chat alone. Decoded together after prompts processed alone, sequences
-  have the logits they have alone, bit for bit, on Qwen3.6 35B-A3B too.
+  same chat alone. Decoded two at a time after prompts processed alone,
+  sequences have the logits they have alone, bit for bit.
 - `examples/attention.rs <gguf> [tokens]`: Metal logits after prefilling the
   same tokens in full batches (flash attention) and in passes of 8 (split-K,
   then split flash attention past 2k positions) have the same top-1 token; over
@@ -381,13 +384,40 @@ chats, `ChatOptions::draft` at 0 or 1 is faster.
 
 ## Performance (M2 Max 38-core GPU, Q4_1)
 
-| | biv Metal | llama.cpp Metal | biv CPU (12 threads) | llama.cpp CPU |
+| | biv Metal | llama.cpp Metal | biv CPU (12 threads) | llama.cpp CPU (8 threads) |
 |---|---|---|---|---|
 | decode, 4 drafts | 28 tok/s greedy, 27–28 sampled | | | |
 | decode, 1 draft | 26 tok/s greedy, 26 sampled | | ~5.7 tok/s | |
-| decode, no draft | 18–19 tok/s | 17.6 tok/s | ~5.3 tok/s | 4.5 tok/s |
-| prompt (~20 tok) | 48 tok/s | 36.8 tok/s | ~9–10 tok/s | 5.0 tok/s |
-| prompt (1541 tok) | 149 tok/s | | | |
+| decode, no draft | 18.8 tok/s | 17.3–17.7 tok/s | 5.3 tok/s | 6.6 tok/s |
+| prompt (64 tok) | | | 11.1 tok/s | 12.2 tok/s |
+| prompt (512 tok) | 197 tok/s | 192–201 tok/s | | |
+| prompt (1536 tok) | 196 tok/s | 200 tok/s | | |
+
+Against llama.cpp (`llama-bench` of build e574a17b0, its defaults: flash
+attention auto, 512-token passes; biv in passes of 512, its Metal default),
+decode of 128 tokens and a prompt of 512, in tok/s:
+
+| | biv decode | llama.cpp decode | biv prompt | llama.cpp prompt |
+|---|---|---|---|---|
+| Qwen3.5 4B Q8_0 | 66.9–67.8 | 65.2 | 1229–1231 | 1256 |
+| Qwen3.8 27B Q4_1 | 18.8 | 17.3–17.7 | 197 | 192–201 |
+| Qwen3.6 35B-A3B Q8_0 | 65.8–66.3 | 63.6–63.9 | 1289–1303 | 1285–1290 |
+
+What it took on Metal: a Q8_0 matvec (without one, a decode step multiplied
+Q8_0 weights in the `mmv` kernel, of 8 columns, for 1) and a matvec per
+(token, expert) pair for decode steps, which took the 4B from 45 to 67 tok/s
+and the 35B-A3B from 43 to 66; the experts' pairs ordered by a threadgroup per
+expert rather than by one threadgroup for all (26 ms of a 436 ms pass of 512
+tokens on the 35B-A3B); and a concurrent encoder, with a barrier before each
+dispatch but between those of a group that don't depend on each other (the
+projections of a layer's input, the gate and up of a feed-forward, the router
+and the shared expert). Passes of 256 tokens prefill slower: 1152 tok/s on the
+35B-A3B, 1189 on the 4B.
+
+On the CPU llama.cpp is ahead. It repacks Q8_0 and Q4_0 weights at load into
+blocks of 4 interleaved rows and multiplies them with i8mm (`smmla`): on the 4B
+(Q8_0) 228 tok/s at prompts against 61, 24.1 at decode against 18.4. Without
+its BLAS backend (Accelerate) it is as fast.
 
 BF16 on Metal decodes at about 7.4 tok/s without drafts, which means reading
 about 400 GB/s of weights, close to the memory bandwidth, and 10.6–11.1 tok/s
@@ -427,8 +457,8 @@ Long contexts (`examples/longctx.rs <gguf> [depth...]`, Metal):
 
 | context | 1k | 4k | 8k | 16k | 32k |
 |---|---|---|---|---|---|
-| decode | 18.1 tok/s | 17.8 | 17.5 | 17.0 | 16.2 |
-| prefill up to it | 184 tok/s | 183 | 177 | 148 | 137 |
+| decode | 18.7 tok/s | 18.5 | 18.2 | 17.7 | 16.8 |
+| prefill up to it | 187 tok/s | 188 | 180 | 169 | 149 |
 
 Decode attention is split-K ("flash decoding"). Each threadgroup takes a KV head with
 its 6 query heads over one range of positions, so K/V is read once per group, and
@@ -449,7 +479,9 @@ arrays went to memory and the kernel was slower than split-K.
 ## Next steps
 
 - Ctrl-C during a long prefill.
-- i8mm (`smmla`) CPU prompt kernel; f16 KV cache on CPU.
+- i8mm (`smmla`) CPU kernels, which llama.cpp runs on weights repacked in 4
+  interleaved rows (see [performance](#performance-m2-max-38-core-gpu-q4_1));
+  f16 KV cache on CPU.
 - AVX-512 (VNNI) kernels for x86-64, 64 bytes per instruction. They are not
   testable under Rosetta, so they need real hardware. AVX-VNNI alone gains
   little: it saves one instruction per 32 products, while the per-block float

@@ -68,28 +68,30 @@ inline float block_q_n_dot_y(device const block_q4_1 * qb_curr, float sumy, thre
     return d * (acc[0] + acc[1] + acc[2] + acc[3]) + sumy * m;
 }
 
+// The matvec kernels are written as `MV_IMPL` functions of one weight matrix,
+// one input row and one output row, which two kernels wrap (`MV_KERNELS`):
+// `mv_*` takes input row `tgpig.y` of a dense matmul, and `mv_id_*` pair
+// `tgpig.y` of the experts' products (the expert `ids[p]`, the input row
+// `p / x_div`, the output row `p`). `tgx` is the threadgroup along the rows,
+// `shmem` threadgroup memory of `MV_SHMEM` floats.
+#define MV_IMPL_ARGS \
+        int k, int rows, ulong w_row_bytes, \
+        device const char * src0, device const float * y, device float * dst_f32, \
+        uint tgx, ushort tiisg, ushort sgitg, threadgroup float * shmem
+#define MV_SHMEM 64
+
 template<typename block_q_type, short NR0, short NSG>
-kernel void mv_q_n(
-        constant MatArgs & args [[buffer(0)]],
-        device const char  * src0 [[buffer(1)]],
-        device const char  * src1 [[buffer(2)]],
-        device       float * dst  [[buffer(3)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+inline void mv_q_n(MV_IMPL_ARGS) {
     constexpr short NW = 32;
     constexpr short NQ = 16;
 
-    const int nb = args.k/QK4_0;
-    const int r0 = (tgpig.x*NSG + sgitg)*NR0;
-    const int r1 = tgpig.y;
-
-    device const float * y = (device const float *) (src1 + r1*args.x_row_bytes);
+    const int nb = k/QK4_0;
+    const int r0 = (tgx*NSG + sgitg)*NR0;
 
     device const block_q_type * ax[NR0];
     FOR_UNROLL (int row = 0; row < NR0; ++row) {
-        const int rr = min(r0 + row, args.rows - 1);
-        ax[row] = (device const block_q_type *) (src0 + rr*args.w_row_bytes);
+        const int rr = min(r0 + row, rows - 1);
+        ax[row] = (device const block_q_type *) (src0 + rr*w_row_bytes);
     }
 
     float sumf[NR0] = {0.f};
@@ -120,41 +122,138 @@ kernel void mv_q_n(
         yb += QK4_0 * 16;
     }
 
-    device float * dst_f32 = dst + r1*args.rows;
     for (int row = 0; row < NR0; ++row) {
         const float tot = simd_sum(sumf[row]);
-        if (tiisg == 0 && r0 + row < args.rows) {
+        if (tiisg == 0 && r0 + row < rows) {
             dst_f32[r0 + row] = tot;
         }
     }
 }
 
-template [[host_name("mv_q4_0")]] kernel void mv_q_n<block_q4_0, 4, 2>(constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
-template [[host_name("mv_q4_1")]] kernel void mv_q_n<block_q4_1, 4, 2>(constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
+#define MV_KERNELS(name, name_id, ...) \
+kernel void name( \
+        constant MatArgs & args [[buffer(0)]], \
+        device const char  * src0 [[buffer(1)]], \
+        device const char  * src1 [[buffer(2)]], \
+        device       float * dst  [[buffer(3)]], \
+        uint3  tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], \
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float shmem[MV_SHMEM]; \
+    __VA_ARGS__(args.k, args.rows, args.w_row_bytes, src0, \
+        (device const float *) (src1 + tgpig.y*args.x_row_bytes), dst + tgpig.y*args.rows, \
+        tgpig.x, tiisg, sgitg, shmem); \
+} \
+kernel void name_id( \
+        constant MatIdArgs & args [[buffer(0)]], \
+        device const char  * src0 [[buffer(1)]], \
+        device const char  * src1 [[buffer(2)]], \
+        device       float * dst  [[buffer(3)]], \
+        device const int   * ids  [[buffer(4)]], \
+        uint3  tgpig [[threadgroup_position_in_grid]], \
+        ushort tiisg [[thread_index_in_simdgroup]], \
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    threadgroup float shmem[MV_SHMEM]; \
+    const uint p = tgpig.y; \
+    __VA_ARGS__(args.k, args.rows, args.w_row_bytes, src0 + ids[p]*args.stride, \
+        (device const float *) (src1 + (p/args.x_div)*args.x_row_bytes), dst + p*args.rows, \
+        tgpig.x, tiisg, sgitg, shmem); \
+}
+
+struct MatIdArgs {
+    int   k;       // input width
+    int   rows;    // weight rows of an expert = output width
+    int   x_div;   // pair p reads input row p / x_div
+    int   pad;
+    ulong w_row_bytes;
+    ulong x_row_bytes;
+    ulong stride;  // bytes from an expert's matrix to the next
+};
+
+MV_KERNELS(mv_q4_0, mv_id_q4_0, mv_q_n<block_q4_0, 4, 2>)
+MV_KERNELS(mv_q4_1, mv_id_q4_1, mv_q_n<block_q4_1, 4, 2>)
+
+// ---------------------------------------------------------------------------
+// matvec: q8_0 (ggml kernel_mul_mv_q8_0_f32_impl, nr0 = 2, nsg = 4): the
+// simdgroups take every 4th group of 8 blocks, summed through `shmem`
+
+inline void mv_q8_0_impl(MV_IMPL_ARGS) {
+    constexpr short NR0 = 2;
+    constexpr short NSG = 4;
+    constexpr short NW = 32;
+    constexpr short NQ = 8;
+
+    const int nb = k/32;
+    const int r0 = tgx*NR0;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const int rr = min(r0 + row, rows - 1);
+        ax[row] = (device const block_q8_0 *) (src0 + rr*w_row_bytes);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[NQ];
+    device const float * yb = y + ib0*32 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+        yb += NSG*NQ*32;
+    }
+
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        if (sgitg == 0) {
+            shmem[NW*row + tiisg] = 0.f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        if (tiisg == 0) {
+            shmem[NW*row + sgitg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0 && r0 + row < rows; ++row) {
+        const float tot = simd_sum(shmem[NW*row + tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            dst_f32[r0 + row] = tot;
+        }
+    }
+}
+
+MV_KERNELS(mv_q8_0, mv_id_q8_0, mv_q8_0_impl)
 
 // ---------------------------------------------------------------------------
 // matvec: q5_K (ggml kernel_mul_mv_q5_K_f32_impl, nr0 = 1, nsg = 2)
 
-kernel void mv_q5_K(
-        constant MatArgs & args [[buffer(0)]],
-        device const char  * src0 [[buffer(1)]],
-        device const char  * src1 [[buffer(2)]],
-        device       float * dst  [[buffer(3)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+inline void mv_q5_K_impl(MV_IMPL_ARGS) {
     constexpr short NSG = 2;
     constexpr int nr0 = 1;
 
-    const int nb = args.k/QK_K;
-    const int r1 = tgpig.y;
-    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
-    if (first_row >= args.rows) {
+    const int nb = k/QK_K;
+    const int first_row = (tgx * NSG + sgitg) * nr0;
+    if (first_row >= rows) {
         return;
     }
 
-    device const block_q5_K * x = (device const block_q5_K *) (src0 + first_row*args.w_row_bytes);
-    device const float     * yy = (device const float      *) (src1 + r1*args.x_row_bytes);
+    device const block_q5_K * x = (device const block_q5_K *) (src0 + first_row*w_row_bytes);
+    device const float     * yy = y;
 
     float sumf[nr0] = {0.f};
     float yl[16], yh[16];
@@ -229,8 +328,7 @@ kernel void mv_q5_K(
         y1 += 4 * QK_K;
     }
 
-    device float * dst_f32 = dst + r1*args.rows;
-    for (int row = 0; row < nr0 && first_row + row < args.rows; ++row) {
+    for (int row = 0; row < nr0 && first_row + row < rows; ++row) {
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst_f32[first_row + row] = tot;
@@ -238,17 +336,12 @@ kernel void mv_q5_K(
     }
 }
 
+MV_KERNELS(mv_q5_K, mv_id_q5_K, mv_q5_K_impl)
+
 // ---------------------------------------------------------------------------
 // matvec: q6_K (ggml kernel_mul_mv_q6_K_f32_impl, nr0 = 2, nsg = 2)
 
-kernel void mv_q6_K(
-        constant MatArgs & args [[buffer(0)]],
-        device const char  * src0 [[buffer(1)]],
-        device const char  * src1 [[buffer(2)]],
-        device       float * dst  [[buffer(3)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+inline void mv_q6_K_impl(MV_IMPL_ARGS) {
     constexpr short NSG = 2;
     constexpr int nr0 = 2;
 
@@ -257,11 +350,10 @@ kernel void mv_q6_K(
     constexpr uint8_t kmask3 = 0x30;
     constexpr uint8_t kmask4 = 0xC0;
 
-    const int nb = args.k/QK_K;
-    const int r1 = tgpig.y;
-    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const int nb = k/QK_K;
+    const int first_row = (tgx * NSG + sgitg) * nr0;
 
-    device const float * yy = (device const float *) (src1 + r1*args.x_row_bytes);
+    device const float * yy = y;
 
     float sumf[nr0] = { 0.f };
     float yl[16];
@@ -278,18 +370,18 @@ kernel void mv_q6_K(
     const short q_offset_h =  32*ip + l0;
 
     for (int i = ix; i < nb; i += 2) {
-        device const float * y = yy + i * QK_K + y_offset;
+        device const float * yi = yy + i * QK_K + y_offset;
 
         for (short l = 0; l < 4; ++l) {
-            yl[4*l + 0] = y[l +  0];
-            yl[4*l + 1] = y[l + 32];
-            yl[4*l + 2] = y[l + 64];
-            yl[4*l + 3] = y[l + 96];
+            yl[4*l + 0] = yi[l +  0];
+            yl[4*l + 1] = yi[l + 32];
+            yl[4*l + 2] = yi[l + 64];
+            yl[4*l + 3] = yi[l + 96];
         }
 
         for (short row = 0; row < nr0; ++row) {
-            const int rr = min(first_row + row, args.rows - 1);
-            device const block_q6_K * x = (device const block_q6_K *) (src0 + rr*args.w_row_bytes) + i;
+            const int rr = min(first_row + row, rows - 1);
+            device const block_q6_K * x = (device const block_q6_K *) (src0 + rr*w_row_bytes) + i;
             device const uint8_t * q1 = x->ql + q_offset_l;
             device const uint8_t * q2 = q1 + 32;
             device const uint8_t * qh = x->qh + q_offset_h;
@@ -308,14 +400,15 @@ kernel void mv_q6_K(
         }
     }
 
-    device float * dst_f32 = dst + r1*args.rows;
-    for (int row = 0; row < nr0 && first_row + row < args.rows; ++row) {
+    for (int row = 0; row < nr0 && first_row + row < rows; ++row) {
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
         }
     }
 }
+
+MV_KERNELS(mv_q6_K, mv_id_q6_K, mv_q6_K_impl)
 
 // ---------------------------------------------------------------------------
 // matvec: float weights, one simdgroup per row, 4 rows per threadgroup
@@ -328,34 +421,25 @@ inline float4 load4(device const ushort * p) {
 }
 
 template<typename T>
-kernel void mv_float(
-        constant MatArgs & args [[buffer(0)]],
-        device const char  * src0 [[buffer(1)]],
-        device const char  * src1 [[buffer(2)]],
-        device       float * dst  [[buffer(3)]],
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const int r = tgpig.x*4 + sgitg;
-    const int t = tgpig.y;
-    if (r >= args.rows) {
+inline void mv_float(MV_IMPL_ARGS) {
+    const int r = tgx*4 + sgitg;
+    if (r >= rows) {
         return;
     }
-    device const T     * w = (device const T     *) (src0 + r*args.w_row_bytes);
-    device const float * y = (device const float *) (src1 + t*args.x_row_bytes);
+    device const T * w = (device const T *) (src0 + r*w_row_bytes);
     float4 acc = 0.f;
-    for (int i = 4*tiisg; i < args.k; i += 128) {
+    for (int i = 4*tiisg; i < k; i += 128) {
         acc += load4(w + i) * load4(y + i);
     }
     const float tot = simd_sum(acc[0] + acc[1] + acc[2] + acc[3]);
     if (tiisg == 0) {
-        dst[t*args.rows + r] = tot;
+        dst_f32[r] = tot;
     }
 }
 
-template [[host_name("mv_f32")]]  kernel void mv_float<float> (constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
-template [[host_name("mv_f16")]]  kernel void mv_float<half>  (constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
-template [[host_name("mv_bf16")]] kernel void mv_float<ushort>(constant MatArgs &, device const char *, device const char *, device float *, uint3, ushort, ushort);
+MV_KERNELS(mv_f32,  mv_id_f32,  mv_float<float>)
+MV_KERNELS(mv_f16,  mv_id_f16,  mv_float<half>)
+MV_KERNELS(mv_bf16, mv_id_bf16, mv_float<ushort>)
 
 // ---------------------------------------------------------------------------
 // dequantize 16 weights into a 4x4 matrix (ggml dequantize.h)
@@ -1674,18 +1758,62 @@ kernel void moe_route(
 
 struct SortArgs { int n_pairs; int n_expert; int mm_min; int mv_base; };
 
-// One threadgroup: the pairs in order of expert (`order`, by pair index within
-// an expert), and the tiles of an expert's pairs, as (expert, first in
-// `order`, pairs). Tiles of 32 for `mm_id`: the full ones, and the last when
-// it has `mm_min` pairs or more; the pairs left in tiles of 8 for `mmv_id`,
-// from `tiles[mv_base]`. `n_tiles` gets the number of each. `tmp` holds
-// 4 * n_expert counters.
-kernel void moe_sort(
+// One threadgroup per expert: the rank of each of its pairs among them, in
+// pair order (`rank`), and how many it has (`count`). `tmp` holds a count per
+// simdgroup.
+kernel void moe_rank(
         constant SortArgs & args [[buffer(0)]],
         device const int * ids   [[buffer(1)]],
-        device uint      * order [[buffer(2)]],
-        device uint4     * tiles [[buffer(3)]],
-        device uint      * n_tiles [[buffer(4)]],
+        device uint      * rank  [[buffer(2)]],
+        device uint      * count [[buffer(3)]],
+        threadgroup uint * tmp [[threadgroup(0)]],
+        uint   tg   [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_position_in_threadgroup]],
+        ushort ntg  [[threads_per_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]]) {
+    const int e = tg;
+    const short nsg = ntg/32;
+    uint base = 0;
+    for (int p0 = 0; p0 < args.n_pairs; p0 += ntg) {
+        const int p = p0 + tid;
+        const uint m = p < args.n_pairs && ids[p] == e;
+        const uint pre = simd_prefix_exclusive_sum(m);
+        const uint tot = simd_sum(m);
+        if (lane == 0) {
+            tmp[sg] = tot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint off = 0, all = 0;
+        for (short s = 0; s < nsg; s++) {
+            off += s < sg ? tmp[s] : 0;
+            all += tmp[s];
+        }
+        if (m) {
+            rank[p] = base + off + pre;
+        }
+        base += all;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        count[e] = base;
+    }
+}
+
+// One threadgroup, after `moe_rank`: the pairs in order of expert (`order`,
+// by pair index within an expert), and the tiles of an expert's pairs, as
+// (expert, first in `order`, pairs). Tiles of 32 for `mm_id`: the full ones,
+// and the last when it has `mm_min` pairs or more; the pairs left in tiles of
+// 8 for `mmv_id`, from `tiles[mv_base]`. `n_tiles` gets the number of each.
+// `tmp` holds 4 * n_expert counters.
+kernel void moe_sort(
+        constant SortArgs & args [[buffer(0)]],
+        device const int  * ids   [[buffer(1)]],
+        device uint       * order [[buffer(2)]],
+        device uint4      * tiles [[buffer(3)]],
+        device uint       * n_tiles [[buffer(4)]],
+        device const uint * rank  [[buffer(5)]],
+        device const uint * count_in [[buffer(6)]],
         threadgroup uint * tmp [[threadgroup(0)]],
         ushort tid [[thread_position_in_threadgroup]],
         ushort ntg [[threads_per_threadgroup]]) {
@@ -1695,11 +1823,7 @@ kernel void moe_sort(
     threadgroup uint * mm0 = tmp + 2*ne;
     threadgroup uint * mv0 = tmp + 3*ne;
     for (int e = tid; e < ne; e += ntg) {
-        uint c = 0;
-        for (int p = 0; p < args.n_pairs; p++) {
-            c += ids[p] == e;
-        }
-        count[e] = c;
+        count[e] = count_in[e];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // pairs of an expert in tiles of 32 for mm_id, the rest in tiles of 8
@@ -1720,13 +1844,11 @@ kernel void moe_sort(
         n_tiles[1] = tv;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int p = tid; p < args.n_pairs; p += ntg) {
+        order[start[ids[p]] + rank[p]] = p;
+    }
     for (int e = tid; e < ne; e += ntg) {
         const uint c = count[e];
-        if (c == 0) continue;
-        uint s = start[e];
-        for (int p = 0; p < args.n_pairs; p++) {
-            if (ids[p] == e) order[s++] = p;
-        }
         const uint m = MM_PAIRS(c);
         for (uint i = 0; i < m; i += 32) {
             tiles[mm0[e] + i/32] = uint4(e, start[e] + i, min(32u, m - i), 0);
@@ -1737,16 +1859,6 @@ kernel void moe_sort(
     }
     #undef MM_PAIRS
 }
-
-struct MatIdArgs {
-    int   k;       // input width
-    int   rows;    // weight rows of an expert = output width
-    int   x_div;   // pair p reads input row p / x_div
-    int   pad;
-    ulong w_row_bytes;
-    ulong x_row_bytes;
-    ulong stride;  // bytes from an expert's matrix to the next
-};
 
 // `mmv` (one row fragment, one input fragment, 2 simdgroups, 4 spans per
 // step) over the pairs of a tile: the weights of its expert, the input rows

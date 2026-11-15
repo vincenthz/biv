@@ -32,7 +32,7 @@ usage: biv [options]
   -n, --max-tokens <n>      tokens per answer, thinking included [default: 8192]
       --cpu                 run on the CPU instead of the GPU (Metal)
   -t, --threads <n>         CPU compute threads [default: all cores]
-  -b, --batch <n>           prompt tokens per forward pass [default: 64 cpu, 256 metal]
+  -b, --batch <n>           prompt tokens per forward pass [default: 64 cpu, 512 metal]
   -d, --draft <n>           tokens drafted per step by the model's MTP head for
                             speculative decoding, 0 to disable [default: 1 cpu, 4 metal]
   -l, --lookup <n>          tokens proposed per step from earlier text of the
@@ -260,7 +260,7 @@ fn make_engine<'m>(
     {
         Ok(Box::new(biv::metal::MetalEngine::new(
             model,
-            batch.unwrap_or(256),
+            batch.unwrap_or(512),
         )?))
     }
     #[cfg(not(target_os = "macos"))]
