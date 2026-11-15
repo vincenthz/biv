@@ -29,7 +29,12 @@ fn main() {
     let engine: &dyn Engine = &model;
     println!("{}", engine.description());
     let sm = engine.session_memory(8192, 4);
-    println!("session(8k ctx, 4 drafts): scratch {:.1} MB, kv {:.1} MB, recurrent {:.1} MB", sm.scratch as f64/1e6, sm.kv as f64/1e6, sm.recurrent as f64/1e6);
+    println!(
+        "session(8k ctx, 4 drafts): scratch {:.1} MB, kv {:.1} MB, recurrent {:.1} MB",
+        sm.scratch as f64 / 1e6,
+        sm.kv as f64 / 1e6,
+        sm.recurrent as f64 / 1e6
+    );
 
     // pseudo-random token ids, like llama-bench
     let mut x: u32 = 12345;
