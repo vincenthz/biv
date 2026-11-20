@@ -1,3 +1,5 @@
+![Project Banner](assets/biv-logo.png)
+
 # biv — Brain In a Vat
 
 BIV is a embeddable inference engine in pure rust to run inside application, without client/server.
