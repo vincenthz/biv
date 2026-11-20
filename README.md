@@ -9,13 +9,27 @@ Our main targets is Apple M class hardware with 32 to 128gb of RAM, with metals.
 BIV has a slower cpu backend that should generically work on any machine with
 enough RAM for a given model.
 
-## Description
+The supported models are limited, if you need exotic set of models, stick to
+llama.cpp, variants, or some generic python framework. We only strives to
+integrate the best models that still run in limited settings
 
-Pure Rust chat inference for **Qwen3.8** GGUF models (llama.cpp architectures
-`qwen35` and `qwen35moe`) and **Flint** (`flint`), on Apple GPUs (Metal) or the CPU (aarch64 NEON, x86-64 AVX2 or AVX-VNNI). No
-C/C++ code and no bindings: the GGUF loader, the quantized kernels (NEON `sdot`,
-AVX2 `maddubs`, VNNI `vpdpbusd`, Metal shaders), the tokenizer, and the model graph are all in Rust
-or MSL. It needs Rust 1.98 or later, for the NEON dot product intrinsics.
+Models architecture supported:
+
+* qwen35 (supported Qwen3.8-27B, Qwen3.5-4B)
+* qwen35moe (supported Qwen3.6-35B-A3B)
+* flint
+
+Note: It might support other models that use those model architectures.
+
+Inference engines:
+
+* Metal (supported Apple Silicon)
+* CPU (some optimisation for aarch64 NEON, X86-64 AVX2 and AVX-VNNI)
+
+BIV is meant to be integrated into application easily, and has small
+dependencies for this purpose.
+
+## Description
 
 ```sh
 cargo build --release
