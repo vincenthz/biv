@@ -201,10 +201,12 @@ node! {
     pub struct Metadata {
         general: General,
         /// the hyperparameters of the `qwen35` architecture
-        qwen35: Qwen35,
+        qwen35: Hparams,
         /// the hyperparameters of the `qwen35moe` architecture: `qwen35`'s,
         /// with mixture of experts feed-forwards
-        qwen35moe: Qwen35,
+        qwen35moe: Hparams,
+        /// the hyperparameters of the `flint` architecture
+        flint: Hparams,
         tokenizer: Tokenizer,
         split: Split,
     }
@@ -234,7 +236,9 @@ node! {
         min_p: Option<f32>,
     }
 
-    pub struct Qwen35 {
+    /// The hyperparameters of an architecture, under its name: the keys of
+    /// every supported one, each having those it uses
+    pub struct Hparams {
         /// layers of the trunk, then the next-n (MTP) layers
         block_count: Option<u64>,
         nextn_predict_layers: Option<u64>,
@@ -254,6 +258,18 @@ node! {
         /// the width of an expert's feed-forward, and the shared expert's
         expert_feed_forward_length: Option<u64>,
         expert_shared_feed_forward_length: Option<u64>,
+        /// the shared expert's width in experts' widths (`flint`)
+        expert_shared_count: Option<u64>,
+        /// how the router's logits become probabilities: 1 softmax, 2
+        /// sigmoid (`flint`; softmax when absent)
+        expert_gating_func: Option<u32>,
+        /// whether the chosen experts' weights are divided by their sum, and
+        /// the factor they are then scaled by
+        expert_weights_norm: Option<bool>,
+        expert_weights_scale: Option<f32>,
+        /// the first layers, which have a dense feed-forward instead of
+        /// experts (`flint`)
+        leading_dense_block_count: Option<u64>,
     }
 
     pub struct Attention {
@@ -264,6 +280,12 @@ node! {
         layer_norm_rms_epsilon: Option<f32>,
         /// per layer, whether it is a delta net (instead of `full_attention_interval`)
         recurrent_layers: Option<Vec<bool>>,
+        /// positions a sliding window layer sees, its token's included
+        sliding_window: Option<u64>,
+        /// per layer, whether it attends over the sliding window only
+        sliding_window_pattern: Option<Vec<bool>>,
+        /// per layer, whether it has rotary embeddings (all when absent)
+        rope_pattern: Option<Vec<bool>>,
     }
 
     pub struct Rope {
@@ -297,6 +319,8 @@ node! {
         merges: Option<Vec<String>>,
         bos_token_id: Option<u32>,
         eos_token_id: Option<u32>,
+        /// every token that ends a generation, the eos token's included
+        eog_token_ids: Option<Vec<u32>>,
         padding_token_id: Option<u32>,
         add_bos_token: Option<bool>,
     }

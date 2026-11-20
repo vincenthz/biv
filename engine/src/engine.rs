@@ -439,7 +439,7 @@ impl Engine for Model<'_> {
     fn new_session(&self, context: usize, draft: usize) -> Result<Box<dyn Session + '_>, Error> {
         Ok(Box::new(CpuSession {
             model: self,
-            state: self.new_state(context, draft > 0)?,
+            state: self.new_state(context, draft)?,
             draft,
         }))
     }

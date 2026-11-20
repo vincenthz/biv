@@ -1,4 +1,4 @@
-//! Interactive chat with a Qwen3.8 GGUF model.
+//! Interactive chat with a Qwen 3.5 family or Flint GGUF model.
 
 use std::error::Error;
 use std::io::{BufRead, IsTerminal, Write};
@@ -26,8 +26,9 @@ usage: biv [options]
                             names it [default: hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1]
   -p, --prompt <text>       answer one message and exit
   -s, --system <text>       system prompt
-      --no-think            disable the reasoning block
+      --no-think            disable the reasoning block (Flint decides by itself)
       --effort <level>      reasoning effort: low, medium, xhigh [default: xhigh]
+                            (Qwen only)
   -c, --ctx <n>             context size in tokens [default: 16384]
   -n, --max-tokens <n>      tokens per answer, thinking included [default: 8192]
       --cpu                 run on the CPU instead of the GPU (Metal)
@@ -395,6 +396,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut chat = Chat::new(engine.as_ref(), &tok, opts)?;
+    if !chat.controls_thinking()
+        && (!chat.opts.thinking || chat.opts.effort != ChatOptions::default().effort)
+    {
+        eprintln!(
+            "note: this model decides by itself whether and how long to think: --no-think and --effort have no effect"
+        );
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -498,6 +506,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Ok(()) => eprintln!("conversation cleared"),
                 Err(e) => eprintln!("error: {e}"),
             },
+            "/think" | "/nothink" if !chat.controls_thinking() => {
+                eprintln!("this model decides by itself whether to think")
+            }
             "/think" | "/nothink" => {
                 chat.opts.thinking = msg == "/think";
                 eprintln!("thinking {}", if chat.opts.thinking { "on" } else { "off" });

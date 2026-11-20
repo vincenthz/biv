@@ -294,12 +294,26 @@ fn record(f: &mut Fingerprint, key: &str, logits: &[f32]) {
     f.push(format!("{key}.top"), joined(top));
 }
 
+/// [`PROBE_PROMPT`] in the model's chat format: ChatML, or Flint's role tokens
+fn probe_prompt(tok: &Tokenizer) -> String {
+    if tok.token_id("<|im_start|>").is_some() || tok.token_id("<|assistant|>").is_none() {
+        return PROBE_PROMPT.into();
+    }
+    PROBE_PROMPT
+        .replace("<|im_start|>system\n", "<|system|>")
+        .replace("<|im_end|>\n<|im_start|>user\n", "<|user|>")
+        .replace(
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            "<|assistant|>",
+        )
+}
+
 /// The fixed run: a prompt in passes of several sizes, greedy decoding, the
 /// same with drafts from the restored prompt, then a sampled chat turn
 pub fn probe(engine: &dyn Engine, tok: &Tokenizer) -> Result<Fingerprint, biv::Error> {
     let mut f = Fingerprint::default();
     f.push("probe.version", PROBE_VERSION);
-    let prompt = tok.encode_with_special(PROBE_PROMPT);
+    let prompt = tok.encode_with_special(&probe_prompt(tok));
     f.push("probe.tokens", joined(&prompt));
     let mut session = engine.new_session(PROBE_CONTEXT, PROBE_DRAFT)?;
 
@@ -366,8 +380,9 @@ pub fn probe(engine: &dyn Engine, tok: &Tokenizer) -> Result<Fingerprint, biv::E
         ..Default::default()
     });
     let mut text = String::new();
+    // the reasoning too, which a model like Flint starts with in any case
     let on_event = |ev: Event<'_>| {
-        if let Event::Answer(a) = ev {
+        if let Event::Answer(a) | Event::Thinking(a) = ev {
             text.push_str(a)
         }
     };

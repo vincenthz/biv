@@ -108,16 +108,22 @@ node! {
         bias: Tensor,
     }
 
-    /// The tensors of `blk.<i>`: a gated attention or a delta net layer
+    /// The tensors of `blk.<i>`: an attention or a delta net layer
     pub struct Block {
         attn_norm: Param,
+        /// the norm before the feed-forward: `post_attention_norm` in `qwen35`,
+        /// `ffn_norm` in `flint`
         post_attention_norm: Param,
+        ffn_norm: Param,
         ffn_gate: Param,
         ffn_up: Param,
         ffn_down: Param,
 
         /// mixture of experts: the router, `[n_embd, n_expert]`
         ffn_gate_inp: Param,
+        /// a bias of the router's probabilities for the choice of the
+        /// experts only, `exp_probs_b.bias`
+        exp_probs_b: Param,
         /// the experts' matrices, `[cols, rows, n_expert]`; gate and up may
         /// be one, gate rows then up rows
         ffn_gate_exps: Param,
@@ -130,13 +136,16 @@ node! {
         ffn_down_shexp: Param,
         ffn_gate_inp_shexp: Param,
 
-        /// query and output gate, interleaved per head
+        /// the queries; in `qwen35`, query and output gate, interleaved per head
         attn_q: Param,
         attn_k: Param,
         attn_v: Param,
         attn_output: Param,
         attn_q_norm: Param,
         attn_k_norm: Param,
+        /// a logit per head added to the softmax of its scores, which no
+        /// value goes with
+        attn_sinks: Param,
 
         /// q, k, v projection of the delta net
         attn_qkv: Param,

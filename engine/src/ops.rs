@@ -199,3 +199,17 @@ pub fn softmax(x: &mut [f32]) {
     let inv = 1.0 / sum;
     x.iter_mut().for_each(|v| *v *= inv);
 }
+
+/// [`softmax`] of `x` and one more logit, `sink`, whose probability is
+/// dropped: the probabilities of `x` sum to less than 1
+pub fn softmax_with_sink(x: &mut [f32], sink: f32) {
+    let max = x.iter().copied().fold(sink, f32::max);
+    let mut sum = 0.0;
+    for v in x.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    sum += (sink - max).exp();
+    let inv = 1.0 / sum;
+    x.iter_mut().for_each(|v| *v *= inv);
+}

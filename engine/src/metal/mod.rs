@@ -20,7 +20,7 @@ use crate::Error;
 use crate::engine::{Batch, DraftLogits, Engine, Pass, SeqId, Session, Snapshot, Work, insert};
 use crate::memory::{DeviceMemory, ModelMemory, SessionMemory, Shape};
 use crate::model::{
-    Config, DRAFT_CAP, DraftVocab, Experts, Ffn, Layer, Mixer, Model, copy_head_rows,
+    Config, DRAFT_CAP, DraftVocab, Experts, Ffn, Gating, Layer, Mixer, Model, copy_head_rows,
 };
 use crate::ops::Weight;
 use crate::prelude::*;
@@ -138,6 +138,10 @@ struct MatIdArgs {
 struct RouteArgs {
     n_expert: i32,
     k: i32,
+    sigmoid: i32,
+    bias: i32,
+    norm: i32,
+    scale: f32,
 }
 
 #[repr(C)]
@@ -180,6 +184,11 @@ struct AttnArgs {
     splits: i32,
     chunk: i32,
     n: i32,
+    gated: i32,
+    window: i32,
+    lo: i32,
+    mask: i32,
+    sinks: i32,
 }
 
 #[repr(C)]
@@ -455,6 +464,10 @@ enum GpuMixer {
         wo: GpuWeight,
         q_norm: Buffer,
         k_norm: Buffer,
+        /// see [`crate::model::Attention`]
+        rope: bool,
+        window: Option<usize>,
+        sinks: Option<Buffer>,
     },
     DeltaNet {
         wqkv: GpuWeight,
@@ -481,11 +494,21 @@ enum GpuFfn {
 /// see [`crate::model::Moe`]
 struct GpuMoe {
     router: GpuWeight,
+    /// added to the probabilities to choose the experts
+    bias: Option<Buffer>,
     gate: GpuExperts,
     up: GpuExperts,
     down: GpuExperts,
-    /// gate, up, down, and the one row of its gate
-    shared: Option<[GpuWeight; 4]>,
+    shared: Option<GpuShared>,
+}
+
+/// see [`crate::model::SharedExpert`]
+struct GpuShared {
+    gate: GpuWeight,
+    up: GpuWeight,
+    down: GpuWeight,
+    /// the one row of its gate, when it has one
+    gate_inp: Option<GpuWeight>,
 }
 
 struct GpuLayer {
@@ -621,6 +644,12 @@ fn gpu_layer(device: &Device, l: &Layer<'_>) -> Result<GpuLayer, Error> {
             wo: wrap(device, &a.wo)?,
             q_norm: upload(device, &a.q_norm)?,
             k_norm: upload(device, &a.k_norm)?,
+            rope: a.rope,
+            window: a.window,
+            sinks: match &a.sinks {
+                Some(s) => Some(upload(device, s)?),
+                None => None,
+            },
         },
         Mixer::DeltaNet(d) => GpuMixer::DeltaNet {
             wqkv: wrap(device, &d.wqkv)?,
@@ -646,16 +675,23 @@ fn gpu_layer(device: &Device, l: &Layer<'_>) -> Result<GpuLayer, Error> {
             },
             Ffn::Moe(m) => GpuFfn::Moe(Box::new(GpuMoe {
                 router: wrap(device, &m.router)?,
+                bias: match &m.bias {
+                    Some(b) => Some(upload(device, b)?),
+                    None => None,
+                },
                 gate: wrap_experts(device, &m.gate)?,
                 up: wrap_experts(device, &m.up)?,
                 down: wrap_experts(device, &m.down)?,
                 shared: match &m.shared {
-                    Some(s) => Some([
-                        wrap(device, &s.gate)?,
-                        wrap(device, &s.up)?,
-                        wrap(device, &s.down)?,
-                        wrap(device, &s.gate_inp)?,
-                    ]),
+                    Some(s) => Some(GpuShared {
+                        gate: wrap(device, &s.gate)?,
+                        up: wrap(device, &s.up)?,
+                        down: wrap(device, &s.down)?,
+                        gate_inp: match &s.gate_inp {
+                            Some(g) => Some(wrap(device, g)?),
+                            None => None,
+                        },
+                    }),
                     None => None,
                 },
             })),
@@ -666,7 +702,7 @@ fn gpu_layer(device: &Device, l: &Layer<'_>) -> Result<GpuLayer, Error> {
 impl<'m> MetalEngine<'m> {
     pub fn new(model: &'m Model<'m>, max_batch: usize) -> Result<Self, Error> {
         let c = &model.cfg;
-        if c.ssm_state != 128 || c.conv_kernel != 4 {
+        if c.recurrent.contains(&true) && (c.ssm_state != 128 || c.conv_kernel != 4) {
             return Err(backend(
                 "metal: the delta net kernels expect state size 128 and conv kernel 4",
             ));
@@ -744,6 +780,10 @@ impl<'m> MetalEngine<'m> {
 
     fn cfg(&self) -> &Config {
         &self.model.cfg
+    }
+
+    fn has_sinks(&self, mixer: &GpuMixer) -> bool {
+        matches!(mixer, GpuMixer::Attention { sinks: Some(_), .. })
     }
 
     fn dispatch(
@@ -1002,15 +1042,15 @@ struct MtpSnapshot {
 }
 
 enum LayerState {
+    /// with `ring`, a sliding window's: position `p` in row `p % ring`, see
+    /// [`Shape::metal_ring`]
     Attention {
         k: Buffer,
         v: Buffer,
+        ring: Option<usize>,
     },
     /// `slots` copies of each state, see `ssm_conv` in the shaders
-    DeltaNet {
-        conv: Buffer,
-        s: Buffer,
-    },
+    DeltaNet { conv: Buffer, s: Buffer },
 }
 
 /// Activation buffers, sized for passes of `batch` tokens and `logit_rows`
@@ -1142,9 +1182,15 @@ fn max_tiles(c: &Config, n: usize, mm_min: usize) -> (usize, usize) {
 /// Width of a feed-forward's activations per token: the experts' of all of a
 /// token's pairs, or the shared expert's
 fn ffn_width(c: &Config) -> usize {
+    let dense = if c.moe.is_none() || c.n_dense_lead > 0 {
+        c.n_ff
+    } else {
+        0
+    };
     c.moe
         .as_ref()
-        .map_or(c.n_ff, |m| (m.n_expert_used * m.n_ff_exp).max(m.n_ff_shexp))
+        .map_or(0, |m| (m.n_expert_used * m.n_ff_exp).max(m.n_ff_shexp))
+        .max(dense)
 }
 
 /// Bytes of the buffers of [`Scratch`] but `moe` and `mtp`, in the order of
@@ -1220,6 +1266,27 @@ impl Shape<'_> {
         self.has_mtp && self.metal_draft(draft, max_batch) > 0
     }
 
+    /// Positions the caches of a sliding window layer hold, when fewer than
+    /// the context, for passes of up to `max_batch` tokens: a pass writes its
+    /// rows before its attention, so the window but a token's own position
+    /// and the pass's positions. A power of two, so that the kernels take
+    /// position `p` at row `p & (ring - 1)`, and a multiple of `ATTN_FLASH_C`,
+    /// so that the `attn_flash` tiles don't wrap.
+    fn metal_ring(&self, context: usize, max_batch: usize) -> Option<usize> {
+        let ring = (self.cfg.sliding_window + max_batch.max(1) - 1)
+            .next_power_of_two()
+            .max(ATTN_FLASH_C);
+        (ring < context.next_multiple_of(ATTN_FLASH_C)).then_some(ring)
+    }
+
+    /// Bytes of a sliding window layer's cache, keys or values
+    fn metal_window_bytes(&self, context: usize, max_batch: usize) -> usize {
+        match self.metal_ring(context, max_batch) {
+            Some(ring) => 2 * ring * self.kv_dim(),
+            None => kv_bytes(context, self.kv_dim()),
+        }
+    }
+
     /// What a [`Seq`] allocates, in whole pages as the device does: a
     /// session's memory but its scratch
     fn metal_seq(&self, context: usize, draft: usize, max_batch: usize) -> SessionMemory {
@@ -1228,9 +1295,14 @@ impl Shape<'_> {
         let slots = self.metal_draft(draft, max_batch) + 1;
         let attention = self.attention_layers() + mtp as usize;
         let (conv, s) = self.delta_net_state();
+        let (window, ring) = (self.window_layers(), self.metal_ring(context, max_batch));
+        let window_bytes = window * 2 * pages(self.metal_window_bytes(context, max_batch));
         SessionMemory {
-            kv: attention * 2 * pages(kv_bytes(context, self.kv_dim())),
-            recurrent: self.delta_net_layers() * (pages(slots * 4 * conv) + pages(slots * 4 * s)),
+            // windows as long as the context grow with it
+            kv: attention * 2 * pages(kv_bytes(context, self.kv_dim()))
+                + if ring.is_none() { window_bytes } else { 0 },
+            recurrent: self.delta_net_layers() * (pages(slots * 4 * conv) + pages(slots * 4 * s))
+                + if ring.is_some() { window_bytes } else { 0 },
             draft_head: if mtp && self.draft_head() > 0 {
                 pages(self.draft_head())
             } else {
@@ -1243,7 +1315,10 @@ impl Shape<'_> {
             },
             // the logits of a verify pass, copied out
             transient: 4 * slots * c.n_vocab,
-            kv_per_token: attention * 2 * 2 * self.kv_dim(),
+            kv_per_token: (attention + if ring.is_none() { window } else { 0 })
+                * 2
+                * 2
+                * self.kv_dim(),
         }
     }
 
@@ -1382,22 +1457,33 @@ impl Seq {
         let draft = shape.metal_draft(draft, max_batch);
         let slots = draft + 1;
         let kv_bytes = kv_bytes(context, shape.kv_dim());
+        let (ring, window_bytes) = (
+            shape.metal_ring(context, max_batch),
+            shape.metal_window_bytes(context, max_batch),
+        );
         let (conv, s) = shape.delta_net_state();
         let mut a = Alloc {
             dev: &e.device,
             bytes: 0,
         };
         let mut layers = Vec::with_capacity(c.n_layer);
-        for &r in &c.recurrent {
+        for (i, &r) in c.recurrent.iter().enumerate() {
             layers.push(if r {
                 LayerState::DeltaNet {
                     conv: a.zeroed(slots * 4 * conv)?,
                     s: a.zeroed(slots * 4 * s)?,
                 }
+            } else if c.is_swa(i) {
+                LayerState::Attention {
+                    k: a.zeroed(window_bytes)?,
+                    v: a.zeroed(window_bytes)?,
+                    ring,
+                }
             } else {
                 LayerState::Attention {
                     k: a.zeroed(kv_bytes)?,
                     v: a.zeroed(kv_bytes)?,
+                    ring: None,
                 }
             });
         }
@@ -1407,6 +1493,7 @@ impl Seq {
                 kv: LayerState::Attention {
                     k: a.zeroed(kv_bytes)?,
                     v: a.zeroed(kv_bytes)?,
+                    ring: None,
                 },
                 rows: 0,
                 last: a.zeroed(last)?,
@@ -1474,12 +1561,33 @@ impl Seq {
             copy_out(buf, offset, len)
         };
         let mut layers = Vec::with_capacity(self.layers.len());
-        for ls in &self.layers {
+        for (i, ls) in self.layers.iter().enumerate() {
             layers.push(match ls {
-                LayerState::Attention { k, v } => LayerSnapshot::Attention {
-                    k: copy(k, 0, self.n_past * kv_row)?,
-                    v: copy(v, 0, self.n_past * kv_row)?,
-                },
+                // the positions a next token may see, in order
+                LayerState::Attention { k, v, ring } => {
+                    let first = self.n_past - window_rows(c, i, self.n_past);
+                    let mut rows = |buf: &Buffer| -> Result<Vec<u8>, Error> {
+                        let bytes = (self.n_past - first) * kv_row;
+                        let mut out = Vec::new();
+                        out.try_reserve_exact(bytes)
+                            .map_err(|_| Error::OutOfMemory { bytes })?;
+                        // runs of rows that don't wrap around the ring
+                        let mut p = first;
+                        while p < self.n_past {
+                            let (row, end) = match ring {
+                                Some(r) => (p % r, self.n_past.min(p - p % r + r)),
+                                None => (p, self.n_past),
+                            };
+                            out.extend_from_slice(&copy(buf, row * kv_row, (end - p) * kv_row)?);
+                            p = end;
+                        }
+                        Ok(out)
+                    };
+                    LayerSnapshot::Attention {
+                        k: rows(k)?,
+                        v: rows(v)?,
+                    }
+                }
                 LayerState::DeltaNet { conv, s } => LayerSnapshot::DeltaNet {
                     conv: copy(conv, self.slot * conv_slot, conv_slot)?,
                     s: copy(s, self.slot * s_slot, s_slot)?,
@@ -1488,7 +1596,7 @@ impl Seq {
         }
         let mtp = match &self.mtp {
             Some(MtpState {
-                kv: LayerState::Attention { k, v },
+                kv: LayerState::Attention { k, v, .. },
                 rows,
                 last,
                 ..
@@ -1522,9 +1630,10 @@ impl Seq {
                 .layers
                 .iter()
                 .zip(&snap.layers)
-                .all(|(ls, s)| match (ls, s) {
+                .enumerate()
+                .all(|(i, (ls, s))| match (ls, s) {
                     (LayerState::Attention { .. }, LayerSnapshot::Attention { k, .. }) => {
-                        k.len() == n_past * kv_row
+                        k.len() == window_rows(c, i, n_past) * kv_row
                     }
                     (LayerState::DeltaNet { .. }, LayerSnapshot::DeltaNet { conv, s }) => {
                         conv.len() == conv_slot && s.len() == s_slot
@@ -1545,9 +1654,17 @@ impl Seq {
         // the states go to slot 0
         for (ls, s) in self.layers.iter().zip(&snap.layers) {
             match (ls, s) {
-                (LayerState::Attention { k, v }, LayerSnapshot::Attention { k: sk, v: sv }) => {
-                    host_bytes(k, 0, sk.len()).copy_from_slice(sk);
-                    host_bytes(v, 0, sv.len()).copy_from_slice(sv);
+                (
+                    LayerState::Attention { k, v, ring },
+                    LayerSnapshot::Attention { k: sk, v: sv },
+                ) => {
+                    let first = n_past - sk.len() / kv_row;
+                    for (j, p) in (first..n_past).enumerate() {
+                        let at = ring.map_or(p, |r| p % r) * kv_row;
+                        let src = j * kv_row..(j + 1) * kv_row;
+                        host_bytes(k, at, kv_row).copy_from_slice(&sk[src.clone()]);
+                        host_bytes(v, at, kv_row).copy_from_slice(&sv[src]);
+                    }
                 }
                 (LayerState::DeltaNet { conv, s }, LayerSnapshot::DeltaNet { conv: sc, s: ss }) => {
                     host_bytes(conv, 0, sc.len()).copy_from_slice(sc);
@@ -1557,7 +1674,7 @@ impl Seq {
             }
         }
         if let (Some(m), Some(sm)) = (&mut self.mtp, &snap.mtp) {
-            let LayerState::Attention { k, v } = &m.kv else {
+            let LayerState::Attention { k, v, .. } = &m.kv else {
                 unreachable!("the MTP head has an attention layer")
             };
             host_bytes(k, 0, sm.k.len()).copy_from_slice(&sm.k);
@@ -1569,6 +1686,16 @@ impl Seq {
         self.n_past = n_past;
         self.verify_from = None;
         Ok(())
+    }
+}
+
+/// Positions of attention layer `i` a next token may see, of the `n_past`
+/// before it: all, or a sliding window's but its own
+fn window_rows(c: &Config, i: usize, n_past: usize) -> usize {
+    if c.is_swa(i) {
+        n_past.min(c.sliding_window - 1)
+    } else {
+        n_past
     }
 }
 
@@ -2069,6 +2196,9 @@ impl MetalEngine<'_> {
                 wo,
                 q_norm,
                 k_norm,
+                rope,
+                window,
+                sinks,
             } => {
                 self.concurrent(|| {
                     self.matmul(enc, wq, h, n, B::at(&s.a1));
@@ -2078,34 +2208,49 @@ impl MetalEngine<'_> {
 
                 let (qd, kv_dim) = (c.n_head * hd, c.n_head_kv * hd);
                 let group = c.n_head / c.n_head_kv;
+                let q_rows = if c.attn_gate { 2 * qd } else { qd };
+                // a buffer for the kernels to bind when the layer has no sinks
+                let sinks = sinks.as_ref().unwrap_or(q_norm);
                 for g in segs {
-                    let LayerState::Attention { k: kc, v: vc } = g.ls else {
+                    let LayerState::Attention { k: kc, v: vc, ring } = g.ls else {
                         unreachable!("layer / state kind mismatch")
                     };
                     let (n, pos0, r) = (g.n, g.pos0, g.row0);
                     let (qg, q, o) = (
-                        B::at(&s.a1).f32_off(r * 2 * qd),
+                        B::at(&s.a1).f32_off(r * q_rows),
                         B::at(&s.q).f32_off(r * qd),
                         B::at(&s.o).f32_off(r * qd),
                     );
+                    // the positions the tokens see: from the first token's window
+                    let lo = window.map_or(0, |w| (pos0 + 1).saturating_sub(w));
+                    let span = pos0 + n - lo;
                     let flash_split =
-                        (2..ATTN_FLASH_MIN).contains(&n) && pos0 + n >= ATTN_FLASH_SPLIT_CTX;
-                    let (splits, chunk) = if flash_split {
-                        flash_splits(c, pos0, n, s.batch)
+                        (2..ATTN_FLASH_MIN).contains(&n) && span >= ATTN_FLASH_SPLIT_CTX;
+                    let (lo, splits, chunk) = if flash_split {
+                        // ranges of whole tiles
+                        let lo = lo / ATTN_FLASH_C * ATTN_FLASH_C;
+                        let (splits, chunk) = flash_splits(c, pos0 + n - lo, n, s.batch);
+                        (lo, splits, chunk)
                     } else {
-                        attn_splits(c, pos0, n, s.batch)
+                        let (splits, chunk) = attn_splits(c, span, n, s.batch);
+                        (lo, splits, chunk)
                     };
                     let args = AttnArgs {
                         n_head: c.n_head as i32,
                         n_kv: c.n_head_kv as i32,
                         hd: hd as i32,
-                        n_rot: c.n_rot as i32,
+                        n_rot: if *rope { c.n_rot as i32 } else { 0 },
                         pos0: pos0 as i32,
                         eps: c.eps,
                         scale: 1.0 / (hd as f32).sqrt(),
                         splits: splits as i32,
                         chunk: chunk as i32,
                         n: n as i32,
+                        gated: c.attn_gate as i32,
+                        window: window.map_or(0, |w| w as i32),
+                        lo: lo as i32,
+                        mask: ring.map_or(-1, |r| r as i32 - 1),
+                        sinks: self.has_sinks(&layer.mixer) as i32,
                     };
                     MetalEngine::args(enc, &args);
                     MetalEngine::bind(
@@ -2132,7 +2277,7 @@ impl MetalEngine<'_> {
 
                     if n >= ATTN_FLASH_MIN {
                         MetalEngine::args(enc, &args);
-                        MetalEngine::bind(enc, &[q, B::at(kc), B::at(vc), qg, o]);
+                        MetalEngine::bind(enc, &[q, B::at(kc), B::at(vc), qg, o, B::at(sinks)]);
                         // queries (half), scores, and a float per row
                         let shmem = ATTN_FLASH_R * (2 * hd + 4 * ATTN_FLASH_C + 4);
                         let blocks = (n * group).div_ceil(ATTN_FLASH_R);
@@ -2171,7 +2316,10 @@ impl MetalEngine<'_> {
                         }
 
                         MetalEngine::args(enc, &args);
-                        MetalEngine::bind(enc, &[B::at(&s.part_o), B::at(&s.part_ml), qg, o]);
+                        MetalEngine::bind(
+                            enc,
+                            &[B::at(&s.part_o), B::at(&s.part_ml), qg, o, B::at(sinks)],
+                        );
                         self.dispatch(enc, Kernel::AttnReduce, [c.n_head, n, 1], [hd, 1, 1], 0);
                     }
                 }
@@ -2191,6 +2339,7 @@ impl MetalEngine<'_> {
                 enc,
                 s,
                 &m.router,
+                m.bias.as_ref(),
                 [&m.gate, &m.up, &m.down],
                 m.shared.as_ref(),
                 n,
@@ -2228,13 +2377,15 @@ impl MetalEngine<'_> {
 
     /// The mixture of experts of the normalized `n` tokens in `h`, added to
     /// the residual stream `x`
+    #[allow(clippy::too_many_arguments)]
     fn encode_moe(
         &self,
         enc: &Encoder,
         s: &Scratch,
         router: &GpuWeight,
+        bias: Option<&Buffer>,
         [gate, up, down]: [&GpuExperts; 3],
-        shared: Option<&[GpuWeight; 4]>,
+        shared: Option<&GpuShared>,
         n: usize,
     ) {
         let c = self.cfg();
@@ -2244,15 +2395,18 @@ impl MetalEngine<'_> {
         let h = B::at(&s.h);
 
         // the shared expert first: the experts then take `a1` and `a2`
-        if let Some([sg, su, sd, gate_inp]) = shared {
+        if let Some(sh) = shared {
             self.concurrent(|| {
-                self.matmul(enc, sg, h, n, B::at(&s.a1));
-                self.matmul(enc, su, h, n, B::at(&s.a2));
-                self.matmul(enc, gate_inp, h, n, B::at(&m.gate));
+                self.matmul(enc, &sh.gate, h, n, B::at(&s.a1));
+                self.matmul(enc, &sh.up, h, n, B::at(&s.a2));
+                if let Some(gate_inp) = &sh.gate_inp {
+                    self.matmul(enc, gate_inp, h, n, B::at(&m.gate));
+                }
                 self.matmul(enc, router, h, n, B::at(&m.logits));
             });
-            self.elementwise(enc, Kernel::Swiglu, B::at(&s.a1), B::at(&s.a2), n * sg.rows);
-            self.matmul(enc, sd, B::at(&s.a1), n, B::at(&s.y));
+            let rows = sh.gate.rows;
+            self.elementwise(enc, Kernel::Swiglu, B::at(&s.a1), B::at(&s.a2), n * rows);
+            self.matmul(enc, &sh.down, B::at(&s.a1), n, B::at(&s.y));
         } else {
             self.matmul(enc, router, h, n, B::at(&m.logits));
         }
@@ -2262,9 +2416,22 @@ impl MetalEngine<'_> {
             &RouteArgs {
                 n_expert: ne as i32,
                 k: k as i32,
+                sigmoid: (cm.gating == Gating::Sigmoid) as i32,
+                bias: bias.is_some() as i32,
+                norm: cm.norm_weights as i32,
+                scale: cm.weights_scale,
             },
         );
-        MetalEngine::bind(enc, &[B::at(&m.logits), B::at(&m.ids), B::at(&m.weights)]);
+        MetalEngine::bind(
+            enc,
+            &[
+                B::at(&m.logits),
+                B::at(&m.ids),
+                B::at(&m.weights),
+                // any buffer without a bias
+                B::at(bias.unwrap_or(&m.logits)),
+            ],
+        );
         self.dispatch(enc, Kernel::MoeRoute, [n, 1, 1], [256, 1, 1], 4 * ne);
 
         // a matvec per pair, when every type of the experts has one
@@ -2369,7 +2536,13 @@ impl MetalEngine<'_> {
             &CombineArgs {
                 n_embd: c.n_embd as i32,
                 k: k as i32,
-                shared: shared.is_some() as i32,
+                shared: match shared {
+                    None => 0,
+                    Some(GpuShared {
+                        gate_inp: Some(_), ..
+                    }) => 1,
+                    Some(_) => 2,
+                },
             },
         );
         MetalEngine::bind(
@@ -2398,10 +2571,10 @@ fn attn_parts(c: &Config, max_batch: usize) -> usize {
     c.n_head * ATTN_MAX_SPLITS.max(max_batch)
 }
 
-/// Split-K ranges and their length for `n` tokens after `pos0`: enough ranges
-/// to fill the GPU when there are few tokens, bounded by the partial buffers
-fn attn_splits(c: &Config, pos0: usize, n: usize, max_batch: usize) -> (usize, usize) {
-    let n_ctx = pos0 + n;
+/// Split-K ranges and their length for `n` tokens over `n_ctx` positions:
+/// enough ranges to fill the GPU when there are few tokens, bounded by the
+/// partial buffers
+fn attn_splits(c: &Config, n_ctx: usize, n: usize, max_batch: usize) -> (usize, usize) {
     let splits = n_ctx
         .div_ceil(ATTN_CHUNK)
         .min(ATTN_MAX_SPLITS)
@@ -2411,9 +2584,8 @@ fn attn_splits(c: &Config, pos0: usize, n: usize, max_batch: usize) -> (usize, u
 }
 
 /// Split-K ranges and their length, a multiple of `ATTN_FLASH_C`, for the
-/// split `attn_flash` kernel on `n` tokens after `pos0`
-fn flash_splits(c: &Config, pos0: usize, n: usize, max_batch: usize) -> (usize, usize) {
-    let n_ctx = pos0 + n;
+/// split `attn_flash` kernel on `n` tokens over `n_ctx` positions
+fn flash_splits(c: &Config, n_ctx: usize, n: usize, max_batch: usize) -> (usize, usize) {
     let max = (attn_parts(c, max_batch) / (n * c.n_head)).clamp(1, ATTN_MAX_SPLITS);
     let chunk = n_ctx.div_ceil(max).next_multiple_of(ATTN_FLASH_C);
     (n_ctx.div_ceil(chunk), chunk)

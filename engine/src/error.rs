@@ -38,9 +38,9 @@ pub enum Error {
         tensor: String,
         ty: GgmlType,
     },
-    /// `general.architecture` is not `qwen35` or `qwen35moe`
+    /// `general.architecture` is not `qwen35`, `qwen35moe` or `flint`
     UnsupportedArchitecture(String),
-    /// The tokenizer is not GPT-2 style BPE with the `qwen35` pre-tokenizer
+    /// The tokenizer is not GPT-2 style BPE with the `qwen35` or `flint` pre-tokenizer
     UnsupportedTokenizer {
         model: String,
         pre: String,
@@ -92,13 +92,13 @@ impl fmt::Display for Error {
             Error::UnsupportedArchitecture(arch) => {
                 write!(
                     f,
-                    "unsupported architecture {arch} (expected qwen35 or qwen35moe)"
+                    "unsupported architecture {arch} (expected qwen35, qwen35moe or flint)"
                 )
             }
             Error::UnsupportedTokenizer { model, pre } => {
                 write!(
                     f,
-                    "unsupported tokenizer {model} / {pre} (expected gpt2 / qwen35)"
+                    "unsupported tokenizer {model} / {pre} (expected gpt2 / qwen35 or flint)"
                 )
             }
             Error::UnsupportedModel(what) => write!(f, "unsupported model: {what}"),

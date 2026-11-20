@@ -1,7 +1,8 @@
-//! Multi-turn chat on top of the model, following the GGUF's chat template
-//! (ChatML with `<think>` reasoning blocks).
+//! Multi-turn chat on top of the model, following the GGUF's chat template:
+//! ChatML with `<think>` reasoning blocks (Qwen 3.5), or Flint's role tokens
+//! (`<|user|>`, `<|assistant|>`, …), told apart by the vocabulary.
 //!
-//! The template keeps past reasoning in the history (`preserve_thinking`
+//! The templates keep past reasoning in the history (Qwen's `preserve_thinking`
 //! defaults to true), so every turn only appends to the sequence: the model
 //! state is kept between turns and only the new tokens are processed. This
 //! also suits the recurrent layers, whose state cannot be rewound (beyond the
@@ -18,6 +19,7 @@
 //! a model with the same vocabulary, by processing them again
 //! ([`Chat::restore_transcript`]).
 
+use alloc::borrow::Cow;
 use alloc::collections::VecDeque;
 
 use crate::Error;
@@ -34,6 +36,102 @@ use PromptPart::{Content, Template};
 const TOOLS_HEADER: &str = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
 /// And after them
 const TOOLS_FOOTER: &str = "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+
+/// The Flint template's text before the tool definitions, which follow each
+/// other without separators
+const FLINT_TOOLS_HEADER: &str = "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+const FLINT_TOOLS_FOOTER: &str = "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n";
+
+/// The chat format of a model, from its special tokens
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    /// `<|im_start|>role\n...<|im_end|>\n`; thinking is switched on or off by
+    /// the generation prompt
+    ChatMl { im_end: TokenId },
+    /// `<|role|>...` with no end tokens: the next role's token ends an answer.
+    /// The model opens its reasoning block itself, when it wants to.
+    Flint { think: TokenId },
+}
+
+/// Message text as the Flint template writes it: its `flint_text` macro
+/// drops NULs and reasoning tags, and escapes the role tokens
+fn flint_text(t: &str) -> Cow<'_, str> {
+    const ROLES: [&str; 7] = [
+        "begin_of_text",
+        "end_of_text",
+        "system",
+        "developer",
+        "user",
+        "assistant",
+        "observation",
+    ];
+    let mut t = Cow::Borrowed(t);
+    for drop in ["\0", "<think>", "</think>"] {
+        if t.contains(drop) {
+            t = Cow::Owned(t.replace(drop, ""));
+        }
+    }
+    for role in ROLES {
+        let token = format!("<|{role}|>");
+        if t.contains(&token) {
+            t = Cow::Owned(t.replace(&token, &format!("&lt;|{role}|&gt;")));
+        }
+    }
+    t
+}
+
+/// The value of a tool's `"function"` key, the function the Flint template
+/// writes, or the whole tool without one
+fn tool_function(tool: &str) -> &str {
+    // the keys of the outer object: skip strings and nested values
+    let b = tool.as_bytes();
+    let (mut i, mut depth) = (0, 0);
+    let string_end = |mut i: usize| {
+        i += 1;
+        while i < b.len() && b[i] != b'"' {
+            i += if b[i] == b'\\' { 2 } else { 1 };
+        }
+        i + 1
+    };
+    while i < b.len() {
+        match b[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b'"' => {
+                let end = string_end(i).min(b.len());
+                if depth == 1 && &tool[i..end] == "\"function\"" {
+                    let rest = tool[end..].trim_start();
+                    if let Some(v) = rest.strip_prefix(':') {
+                        let v = v.trim_start();
+                        let start = tool.len() - v.len();
+                        // the value's end: back to depth 1 at a ',' or the '}'
+                        let (mut j, mut d) = (start, 0);
+                        while j < b.len() {
+                            match b[j] {
+                                b'"' => {
+                                    j = string_end(j);
+                                    continue;
+                                }
+                                b'{' | b'[' => d += 1,
+                                b'}' | b']' if d == 0 => break,
+                                b'}' | b']' => d -= 1,
+                                b',' if d == 0 => break,
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        return tool[start..j.min(b.len())].trim_end();
+                    }
+                }
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    tool
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
@@ -69,6 +167,8 @@ impl ReasoningEffort {
 #[derive(Debug, Clone)]
 pub struct ChatOptions {
     pub system: Option<String>,
+    /// whether the model reasons before answering, and how much: for models
+    /// that can be told, see [`Chat::controls_thinking`]
     pub thinking: bool,
     pub effort: ReasoningEffort,
     /// per answer, thinking included
@@ -128,6 +228,14 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
+    /// From the text between `<tool_call>` and `</tool_call>` in `format`
+    fn parse_as(format: Format, text: &str) -> Option<Self> {
+        match format {
+            Format::ChatMl { .. } => Self::parse(text),
+            Format::Flint { .. } => Self::parse_flint(text),
+        }
+    }
+
     /// From the text between `<tool_call>` and `</tool_call>`:
     /// `<function=NAME>`, then `<parameter=NAME>\nVALUE\n</parameter>` for each
     /// parameter, then `</function>`
@@ -157,6 +265,34 @@ impl ToolCall {
         } else {
             None
         }
+    }
+}
+
+impl ToolCall {
+    /// Flint's: `NAME`, then `<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>`
+    /// for each argument
+    fn parse_flint(text: &str) -> Option<Self> {
+        let (name, mut rest) = text.split_at(text.find("<arg_key>").unwrap_or(text.len()));
+        let name = name.trim();
+        if name.is_empty() || name.contains('<') {
+            return None;
+        }
+        let mut arguments = Vec::new();
+        loop {
+            rest = rest.trim_start();
+            if rest.is_empty() {
+                break;
+            }
+            let (key, after) = rest.strip_prefix("<arg_key>")?.split_once("</arg_key>")?;
+            let value = after.trim_start().strip_prefix("<arg_value>")?;
+            let (value, after) = value.split_once("</arg_value>")?;
+            arguments.push((key.trim().to_string(), value.to_string()));
+            rest = after;
+        }
+        Some(ToolCall {
+            name: name.to_string(),
+            arguments,
+        })
     }
 }
 
@@ -218,7 +354,7 @@ pub struct Chat<'m> {
     history: Vec<TokenId>,
     /// consecutive steps whose proposal from the conversation was all right
     lookup_run: usize,
-    im_end: TokenId,
+    format: Format,
     think_end: TokenId,
     tool_call: TokenId,
     tool_call_end: TokenId,
@@ -231,6 +367,17 @@ impl<'m> Chat<'m> {
         opts: ChatOptions,
     ) -> Result<Self, Error> {
         let id = |s: &str| tok.token_id(s).ok_or_else(|| Error::MissingToken(s.into()));
+        let has = |s: &str| tok.token_id(s).is_some();
+        let format = if !has("<|im_start|>") && has("<|assistant|>") && has("<|observation|>") {
+            Format::Flint {
+                think: id("<think>")?,
+            }
+        } else {
+            id("<|im_start|>")?;
+            Format::ChatMl {
+                im_end: id("<|im_end|>")?,
+            }
+        };
         Ok(Chat {
             engine,
             tok,
@@ -240,7 +387,7 @@ impl<'m> Chat<'m> {
             generated: Vec::new(),
             history: Vec::new(),
             lookup_run: 0,
-            im_end: id("<|im_end|>")?,
+            format,
             think_end: id("</think>")?,
             tool_call: id("<tool_call>")?,
             tool_call_end: id("</tool_call>")?,
@@ -264,6 +411,12 @@ impl<'m> Chat<'m> {
         self.session.n_past()
     }
 
+    /// Whether [`ChatOptions::thinking`] and [`ChatOptions::effort`] have an
+    /// effect: Flint decides by itself when to reason, and how much
+    pub fn controls_thinking(&self) -> bool {
+        matches!(self.format, Format::ChatMl { .. })
+    }
+
     /// The memory of the conversation's session
     pub fn memory(&self) -> SessionMemory {
         self.session.memory()
@@ -281,7 +434,8 @@ impl<'m> Chat<'m> {
     pub fn save(&mut self) -> Result<Prefix, Error> {
         if self.session.n_past() == 0 {
             let mut parts = Vec::new();
-            self.system_block(&mut parts);
+            let prompt = self.system_prompt();
+            self.system_block(prompt.as_deref(), &mut parts);
             let system = self.tok.encode_prompt(&parts);
             if system.len() >= self.opts.context {
                 return Err(Error::ContextFull {
@@ -396,15 +550,34 @@ impl<'m> Chat<'m> {
         }
     }
 
-    /// The system block, as the chat template writes it: the reasoning
-    /// instructions, the tools, the system prompt; nothing without any of them
-    fn system_block<'s>(&'s self, parts: &mut Vec<PromptPart<'s>>) {
-        let system = self
-            .opts
-            .system
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+    /// The system prompt as the chat template writes it, if any
+    fn system_prompt(&self) -> Option<Cow<'_, str>> {
+        let system = self.opts.system.as_deref()?;
+        let system = match self.format {
+            Format::ChatMl { .. } => Cow::Borrowed(system.trim()),
+            Format::Flint { .. } => flint_text(system),
+        };
+        (!system.is_empty()).then_some(system)
+    }
+
+    /// The system block, as the chat template writes it, with the
+    /// [`Chat::system_prompt`]: the reasoning instructions, the tools, the
+    /// system prompt; nothing without any of them. Flint's has the system
+    /// prompt, then the tools in a block of their own.
+    fn system_block<'s>(&'s self, system: Option<&'s str>, parts: &mut Vec<PromptPart<'s>>) {
+        if let Format::Flint { .. } = self.format {
+            if let Some(s) = system {
+                parts.extend([Template("<|system|>"), Content(s)]);
+            }
+            if !self.opts.tools.is_empty() {
+                parts.push(Template(FLINT_TOOLS_HEADER));
+                for tool in &self.opts.tools {
+                    parts.push(Content(tool_function(tool.trim())));
+                }
+                parts.push(Template(FLINT_TOOLS_FOOTER));
+            }
+            return;
+        }
         let reasoning = if self.opts.thinking {
             self.opts.effort.instructions()
         } else {
@@ -439,21 +612,27 @@ impl<'m> Chat<'m> {
 
     /// The tokens of the next turn: what is left of the previous answer, the
     /// system block on the first turn, `message` and the generation prompt
-    fn turn_tokens<'s>(&'s self, message: &[PromptPart<'s>]) -> Vec<TokenId> {
+    fn turn_tokens(&self, message: &[PromptPart<'_>]) -> Vec<TokenId> {
+        let chatml = matches!(self.format, Format::ChatMl { .. });
+        let system = self.system_prompt();
         let mut parts = Vec::new();
-        if !self.pending.is_empty() {
+        if chatml && !self.pending.is_empty() {
             parts.push(Template("\n"));
         }
         if self.session.n_past() == 0 {
-            self.system_block(&mut parts);
+            self.system_block(system.as_deref(), &mut parts);
         }
         parts.extend_from_slice(message);
-        parts.push(Template("<|im_start|>assistant\n"));
-        parts.push(Template(if self.opts.thinking {
-            "<think>\n"
+        if chatml {
+            parts.push(Template("<|im_start|>assistant\n"));
+            parts.push(Template(if self.opts.thinking {
+                "<think>\n"
+            } else {
+                "<think>\n\n</think>\n\n"
+            }));
         } else {
-            "<think>\n\n</think>\n\n"
-        }));
+            parts.push(Template("<|assistant|>"));
+        }
         let mut t = self.pending.clone();
         t.extend(self.tok.encode_prompt(&parts));
         t
@@ -468,11 +647,16 @@ impl<'m> Chat<'m> {
         on_event: impl FnMut(Event<'_>),
         stop: impl Fn() -> bool,
     ) -> Result<TurnStats, Error> {
-        let prompt = self.turn_tokens(&[
-            Template("<|im_start|>user\n"),
-            Content(user.trim()),
-            Template("<|im_end|>\n"),
-        ]);
+        let prompt = match self.format {
+            Format::ChatMl { .. } => self.turn_tokens(&[
+                Template("<|im_start|>user\n"),
+                Content(user.trim()),
+                Template("<|im_end|>\n"),
+            ]),
+            Format::Flint { .. } => {
+                self.turn_tokens(&[Template("<|user|>"), Content(&flint_text(user))])
+            }
+        };
         self.answer(prompt, sampler, on_event, stop)
     }
 
@@ -485,15 +669,30 @@ impl<'m> Chat<'m> {
         on_event: impl FnMut(Event<'_>),
         stop: impl Fn() -> bool,
     ) -> Result<TurnStats, Error> {
-        let mut message = vec![Template("<|im_start|>user")];
-        for r in responses {
-            message.extend([
-                Template("\n<tool_response>\n"),
-                Content(r.as_ref().trim()),
-                Template("\n</tool_response>"),
-            ]);
+        let flint: Vec<Cow<'_, str>> = match self.format {
+            Format::ChatMl { .. } => Vec::new(),
+            Format::Flint { .. } => responses.iter().map(|r| flint_text(r.as_ref())).collect(),
+        };
+        let mut message = Vec::new();
+        if let Format::ChatMl { .. } = self.format {
+            message.push(Template("<|im_start|>user"));
+            for r in responses {
+                message.extend([
+                    Template("\n<tool_response>\n"),
+                    Content(r.as_ref().trim()),
+                    Template("\n</tool_response>"),
+                ]);
+            }
+            message.push(Template("<|im_end|>\n"));
+        } else {
+            for r in &flint {
+                message.extend([
+                    Template("<|observation|><tool_response>"),
+                    Content(r),
+                    Template("</tool_response>"),
+                ]);
+            }
         }
-        message.push(Template("<|im_end|>\n"));
         let prompt = self.turn_tokens(&message);
         self.answer(prompt, sampler, on_event, stop)
     }
@@ -525,7 +724,11 @@ impl<'m> Chat<'m> {
         let mut logits = self.session.forward(last);
         on_event(Event::PromptDone);
 
-        let mut thinking = self.opts.thinking;
+        let (mut thinking, think) = match self.format {
+            Format::ChatMl { .. } => (self.opts.thinking, None),
+            // the model opens its reasoning block itself
+            Format::Flint { think } => (false, Some(think)),
+        };
         let mut decoder = StreamDecoder::default();
         // the template puts "\n\n" after </think>: don't echo it
         let mut skip_leading_newlines = !thinking;
@@ -539,15 +742,22 @@ impl<'m> Chat<'m> {
             stats.gen_tokens += 1;
             self.generated.push(next);
 
-            if next == self.im_end || self.tok.eog.contains(&next) {
+            if self.is_end(next) {
                 if let Some(text) = call.take() {
                     on_event(Event::Answer(&format!("<tool_call>{text}")));
                 }
-                // the end marker closes the message in the history
-                self.pending.push(self.im_end);
+                // the end marker closes the message in the history; Flint's
+                // is the next role's token, which the next turn writes
+                if let Format::ChatMl { im_end } = self.format {
+                    self.pending.push(im_end);
+                }
                 break;
             }
-            if next == self.think_end && thinking {
+            if Some(next) == think && !thinking && call.is_none() {
+                thinking = true;
+                held_newlines.clear();
+                skip_leading_newlines = true;
+            } else if next == self.think_end && thinking {
                 thinking = false;
                 skip_leading_newlines = true;
                 held_newlines.clear();
@@ -558,7 +768,7 @@ impl<'m> Chat<'m> {
                 call = Some(String::new());
             } else if next == self.tool_call_end && call.is_some() {
                 let text = call.take().unwrap_or_default();
-                match ToolCall::parse(&text) {
+                match ToolCall::parse_as(self.format, &text) {
                     Some(c) => {
                         on_event(Event::ToolCall(&c));
                         stats.tool_calls.push(c);
@@ -604,13 +814,21 @@ impl<'m> Chat<'m> {
                     on_event(Event::Answer(&format!("<tool_call>{text}")));
                     self.pending.push(self.tool_call_end);
                 }
-                self.pending.push(self.im_end);
+                if let Format::ChatMl { im_end } = self.format {
+                    self.pending.push(im_end);
+                }
                 break;
             }
             logits = self.advance(next, &mut spec, &mut stats, sampler);
         }
         self.settle(&mut spec);
         Ok(stats)
+    }
+
+    /// Whether `token` ends an answer
+    fn is_end(&self, token: TokenId) -> bool {
+        matches!(self.format, Format::ChatMl { im_end } if token == im_end)
+            || self.tok.eog.contains(&token)
     }
 
     /// The token after the sequence, from `logits`, the logits after it. With
@@ -891,9 +1109,56 @@ impl Session for Empty {
 
 #[cfg(test)]
 mod tests {
-    use super::{continuation, speculative_choice};
+    use super::{Cow, ToolCall, continuation, flint_text, speculative_choice, tool_function};
     use crate::prelude::*;
     use crate::sampler::{Sampler, SamplerConfig};
+
+    #[test]
+    fn flint_text_escapes_roles() {
+        assert!(matches!(flint_text("plain"), Cow::Borrowed("plain")));
+        assert_eq!(
+            flint_text("a\0<think>b</think> <|user|><|observation|>"),
+            "ab &lt;|user|&gt;&lt;|observation|&gt;"
+        );
+        // one pass per replacement, in the template's order
+        assert_eq!(flint_text("<th<think>ink>"), "<think>");
+        assert_eq!(flint_text("<|us\0er|>"), "&lt;|user|&gt;");
+    }
+
+    #[test]
+    fn tool_function_takes_the_inner_object() {
+        let f = r#"{"name": "a", "parameters": {"x": [1, {"y": "}"}]}}"#;
+        assert_eq!(
+            tool_function(&format!(r#"{{"type": "function", "function": {f}}}"#)),
+            f
+        );
+        assert_eq!(
+            tool_function(&format!(r#"{{"function":{f},"type":"function"}}"#)),
+            f
+        );
+        // a "function" key deeper down, or in a string, is not the tool's
+        let t = r#"{"name": "f", "parameters": {"function": {}}, "d": "\"function\": 1"}"#;
+        assert_eq!(tool_function(t), t);
+    }
+
+    #[test]
+    fn flint_tool_call_parses() {
+        let c = ToolCall::parse_flint("get_weather <arg_key>city</arg_key><arg_value>Paris</arg_value>\n<arg_key> days </arg_key> <arg_value>[1, 2]</arg_value>").unwrap();
+        assert_eq!(c.name, "get_weather");
+        assert_eq!(
+            c.arguments,
+            [
+                ("city".into(), "Paris".into()),
+                ("days".into(), "[1, 2]".into())
+            ]
+        );
+        assert_eq!(ToolCall::parse_flint("now").unwrap().arguments, []);
+        assert!(ToolCall::parse_flint("").is_none());
+        assert!(ToolCall::parse_flint("f<arg_key>x</arg_key>").is_none());
+        assert!(
+            ToolCall::parse_flint("f<arg_key>x</arg_key><arg_value>1</arg_value> junk").is_none()
+        );
+    }
 
     #[test]
     fn speculative_choice_follows_the_target() {

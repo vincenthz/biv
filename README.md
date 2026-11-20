@@ -1,7 +1,16 @@
 # biv — Brain In a Vat
 
+BIV is a embeddable inference engine in pure rust to run inside application, without client/server.
+
+BIV targets modern open weight models (as of 2026) that can be run on laptops;
+Our main targets is Apple M class hardware with 32 to 128gb of RAM, with metals.
+BIV has a slower cpu backend that should generically work on any machine with
+enough RAM for a given model.
+
+## Description
+
 Pure Rust chat inference for **Qwen3.8** GGUF models (llama.cpp architectures
-`qwen35` and `qwen35moe`), on Apple GPUs (Metal) or the CPU (aarch64 NEON, x86-64 AVX2 or AVX-VNNI). No
+`qwen35` and `qwen35moe`) and **Flint** (`flint`), on Apple GPUs (Metal) or the CPU (aarch64 NEON, x86-64 AVX2 or AVX-VNNI). No
 C/C++ code and no bindings: the GGUF loader, the quantized kernels (NEON `sdot`,
 AVX2 `maddubs`, VNNI `vpdpbusd`, Metal shaders), the tokenizer, and the model graph are all in Rust
 or MSL. It needs Rust 1.98 or later, for the NEON dot product intrinsics.
@@ -61,6 +70,26 @@ tokens/s on an M2 Max, and 85 to 120 with its MTP head drafting:
 hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-Q8_0.gguf   # 37.8 GB
 ./target/release/biv -m hf.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF:Q8_0
 ```
+
+[Flint](https://huggingface.co/RecursiveSI/flint) (`flint`: 49 layers, 256
+experts with sigmoid routing, 6 per token, plus 2 ungated shared experts; the
+first 2 layers dense) runs on both backends too, at about 75 tokens/s on an M2
+Max (Q8_0):
+
+```sh
+hf download ggml-org/Flint-GGUF Flint-Q8_0.gguf   # 42.3 GB
+./target/release/biv -m hf.co/ggml-org/Flint-GGUF:Q8_0
+```
+
+Its attention alternates sliding window layers (513 positions, with rope) and
+full attention layers without positional encoding (every fourth, and the first
+two and the last), each head with a learned sink logit. The caches of the
+window layers are rings of a fixed size, so the KV cache of a long context is
+mostly that of its 14 full attention layers. It decides by itself whether to
+reason before answering: `--no-think`, `/nothink` and `--effort` have no effect.
+Its GGUF has no MTP head. Its tokenizer follows Hugging Face `tokenizers`,
+whose pre-tokenizer splits words on case changes (`parseHttp` is `parse`,
+`Http`); llama.cpp's matcher doesn't, so its token ids differ on such words.
 
 Decoding is speculative by default: the model's MTP head drafts the next tokens
 (4 on Metal, 1 on the CPU), and the trunk checks them in the same pass as the
@@ -184,14 +213,14 @@ time either way (cpuid). Its features:
 | `engine/src/ops.rs` | matmul (threaded with rayon), norms, rope, softmax |
 | `engine/src/par.rs` | rayon's parallel iterators, or sequential ones of the same names |
 | `engine/src/math.rs` | libm float functions without `std` |
-| `engine/src/model.rs` | the `qwen35` / `qwen35moe` graph: port of llama.cpp `src/models/qwen35.cpp`, `qwen35moe.cpp` and `delta-net-base.cpp`; expert routing; MTP drafting |
+| `engine/src/model.rs` | the `qwen35` / `qwen35moe` / `flint` graphs: port of llama.cpp `src/models/qwen35.cpp`, `qwen35moe.cpp`, `delta-net-base.cpp` and `flint.cpp`; expert routing; sliding windows; MTP drafting |
 | `engine/src/memory.rs` | memory of a model and its sessions: estimated from the GGUF alone (`Footprint`), or reported by engines and sessions |
 | `engine/src/engine.rs` | `Engine` / `Session` / `Batch` traits shared by the backends (draft / verify / keep for speculative decoding); CPU implementation; sequential batches |
 | `engine/src/batch.rs` | continuous batching: the scheduler, and the `Engine` handle whose sessions it serves |
 | `engine/src/metal/mod.rs` | Metal backend: no-copy weight buffers, per-sequence KV/recurrent state, one command buffer per forward pass of one or more sequences, on a concurrent encoder |
 | `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels, expert routing and sorting, the matmul / matvec over each expert's tokens, and the matvec per (token, expert) pair of decode steps |
-| `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35` pre-tokenizer regex, matched by hand |
-| `engine/src/chat.rs` | chat template (ChatML with `<think>`), incremental multi-turn state, the speculative decoding loop |
+| `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35` and `flint` pre-tokenizer regexes, matched by hand |
+| `engine/src/chat.rs` | chat templates (ChatML with `<think>`, Flint's role tokens), incremental multi-turn state, the speculative decoding loop |
 | `engine/src/transcript.rs` | a conversation as token ids, and its bytes |
 | `engine/src/sampler.rs` | temperature / top-k / top-p / min-p / penalties |
 | `src/lib.rs` | GGUF files: shard discovery, mmap |

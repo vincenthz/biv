@@ -55,7 +55,8 @@ impl ModelMemory {
 /// The f32 values the model converts its small tensors to
 fn params(c: &Config, has_mtp: bool) -> usize {
     let e = c.n_embd;
-    let attention = 2 * e + 2 * c.head_dim;
+    let sinks = if c.attn_sinks { c.n_head } else { 0 };
+    let attention = 2 * e + 2 * c.head_dim + sinks;
     let delta_net = 2 * e + c.conv_kernel * c.conv_dim() + 2 * c.ssm_v_heads + c.ssm_state;
     let layers: usize = c
         .recurrent
@@ -75,8 +76,9 @@ pub struct SessionMemory {
     /// context. The CPU reserves them without writing: the system only
     /// commits the pages of the tokens held, [`SessionMemory::kv_used`].
     pub kv: usize,
-    /// conv and recurrent states of the delta net layers, every copy the
-    /// session keeps
+    /// states of a fixed size: the conv and recurrent states of the delta
+    /// net layers, every copy the session keeps, and the kv caches of the
+    /// sliding window layers
     pub recurrent: usize,
     /// output head rows of the MTP head's draft vocabulary
     pub draft_head: usize,
@@ -136,12 +138,19 @@ pub(crate) struct Shape<'a> {
 }
 
 impl Shape<'_> {
+    /// The attention layers over the whole context, whose kv caches grow
+    /// with it
     pub(crate) fn attention_layers(&self) -> usize {
-        self.cfg.recurrent.iter().filter(|&&r| !r).count()
+        self.cfg.n_layer - self.delta_net_layers() - self.window_layers()
+    }
+
+    /// The attention layers over a sliding window
+    pub(crate) fn window_layers(&self) -> usize {
+        self.cfg.swa.iter().filter(|&&w| w).count()
     }
 
     pub(crate) fn delta_net_layers(&self) -> usize {
-        self.cfg.n_layer - self.attention_layers()
+        self.cfg.recurrent.iter().filter(|&&r| r).count()
     }
 
     /// floats per position of a kv cache, keys or values
@@ -153,7 +162,7 @@ impl Shape<'_> {
     pub(crate) fn delta_net_state(&self) -> (usize, usize) {
         let c = self.cfg;
         (
-            (c.conv_kernel - 1) * c.conv_dim(),
+            c.conv_kernel.saturating_sub(1) * c.conv_dim(),
             c.ssm_v_heads * c.ssm_state * c.ssm_state,
         )
     }
@@ -178,6 +187,7 @@ impl Shape<'_> {
         let attention = self.attention_layers() + mtp as usize;
         let (conv, s) = self.delta_net_state();
         let state = 4 * (conv + s);
+        let window = self.window_layers() * 2 * 4 * c.cpu_ring(context, draft) * kv_dim;
 
         // a verify pass keeps the states after each token but the last, and
         // each layer builds its copy before handing it over
@@ -202,7 +212,7 @@ impl Shape<'_> {
 
         SessionMemory {
             kv: attention * 2 * 4 * context.saturating_mul(kv_dim),
-            recurrent: self.delta_net_layers() * state,
+            recurrent: self.delta_net_layers() * state + window,
             draft_head: if mtp { self.draft_head() } else { 0 },
             scratch: if mtp { 4 * e } else { 0 },
             transient: saved + activations + logits,

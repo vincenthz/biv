@@ -21,7 +21,7 @@ fn main() {
     let tok = Tokenizer::from_gguf(&g).unwrap();
     let model = Model::load(&g).unwrap();
     let ids = tok.encode_with_special(&prompt);
-    let mut st = model.new_state(ids.len() + n_gen, false).unwrap();
+    let mut st = model.new_state(ids.len() + n_gen, 0).unwrap();
     eprintln!("prompt tokens: {ids:?}");
     let t0 = Instant::now();
     let mut logits = model.forward(&mut st, &ids);

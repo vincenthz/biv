@@ -1,4 +1,5 @@
-//! Pure Rust inference for Qwen3.8 (llama.cpp `qwen35` and `qwen35moe` GGUF models), on CPU or Metal.
+//! Pure Rust inference for Qwen3.8 (llama.cpp `qwen35` and `qwen35moe` GGUF models) and
+//! Flint (`flint`), on CPU or Metal.
 //!
 //! No I/O: a model is parsed from the bytes of its GGUF, however the caller
 //! got them (mmap, embedded, read into memory). The crate is `no_std` + `alloc`

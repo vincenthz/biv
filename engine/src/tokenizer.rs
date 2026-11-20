@@ -1,5 +1,5 @@
 //! GPT-2 style byte-level BPE, as stored in GGUF (`tokenizer.ggml.model = gpt2`)
-//! with the `qwen35` pre-tokenizer.
+//! with the `qwen35` or `flint` pre-tokenizer.
 
 use core::cmp::Ordering;
 
@@ -23,7 +23,15 @@ pub enum PromptPart<'a> {
     Content(&'a str),
 }
 
+/// How text is split into pieces before BPE
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pre {
+    Qwen35,
+    Flint,
+}
+
 pub struct Tokenizer {
+    pre: Pre,
     /// token text, in the GPT-2 byte-to-unicode encoding (or raw for special tokens)
     tokens: Vec<String>,
     /// decoded bytes of each token
@@ -268,13 +276,17 @@ impl Tokenizer {
     pub fn from_metadata(m: &Metadata) -> Result<Self, Error> {
         let ggml = &m.tokenizer.ggml;
         let model = need!(m, tokenizer.ggml.model)?;
-        let pre = ggml.pre.as_deref().unwrap_or("qwen35");
-        if model != "gpt2" || pre != "qwen35" {
-            return Err(Error::UnsupportedTokenizer {
-                model: model.clone(),
-                pre: pre.into(),
-            });
-        }
+        let pre_name = ggml.pre.as_deref().unwrap_or("qwen35");
+        let pre = match (model.as_str(), pre_name) {
+            ("gpt2", "qwen35") => Pre::Qwen35,
+            ("gpt2", "flint") => Pre::Flint,
+            _ => {
+                return Err(Error::UnsupportedTokenizer {
+                    model: model.clone(),
+                    pre: pre_name.into(),
+                });
+            }
+        };
         let tokens: Vec<String> = need!(m, tokenizer.ggml.tokens)?.clone();
         let types: Vec<i64> = match &ggml.token_type {
             Some(a) => a.iter().map(|&t| t.into()).collect(),
@@ -355,15 +367,27 @@ impl Tokenizer {
 
         let eos = *need!(m, tokenizer.ggml.eos_token_id)?;
         let mut eog = vec![eos];
-        for t in ["<|im_end|>", "<|endoftext|>", "<|end_of_text|>"] {
-            if let Some(i) = id(t, "")
-                && !eog.contains(&i)
-            {
+        let mut add = |i: TokenId| {
+            if (i as usize) < tokens.len() && !eog.contains(&i) {
                 eog.push(i);
+            }
+        };
+        for &i in ggml.eog_token_ids.iter().flatten() {
+            add(i);
+        }
+        let mut names = vec!["<|im_end|>", "<|endoftext|>", "<|end_of_text|>"];
+        if pre == Pre::Flint {
+            // the roles that follow an assistant turn, which has no end token
+            names.extend(["<|user|>", "<|observation|>", "<|developer|>"]);
+        }
+        for t in names {
+            if let Some(i) = id(t, "") {
+                add(i);
             }
         }
 
         Ok(Tokenizer {
+            pre,
             tokens,
             bytes,
             is_special,
@@ -460,8 +484,13 @@ impl Tokenizer {
 
     fn encode_into(&self, text: &str, out: &mut Vec<TokenId>) {
         let mut scratch = Bpe::default();
-        for piece in pre_split(text) {
-            self.bpe(piece.as_bytes(), &mut scratch, out);
+        match self.pre {
+            Pre::Qwen35 => {
+                for piece in pre_split(text) {
+                    self.bpe(piece.as_bytes(), &mut scratch, out);
+                }
+            }
+            Pre::Flint => flint_split(text, |piece| self.bpe(piece.as_bytes(), &mut scratch, out)),
         }
     }
 
@@ -625,6 +654,198 @@ fn piece_len(s: &str) -> usize {
     }
 }
 
+/// The `flint` pre-tokenizer, as Hugging Face `tokenizers` has it: three
+/// regex splits in turn, each splitting the pieces of the one before into
+/// its matches and the text between them
+///
+/// ```text
+/// \p{N}{1,3}
+/// [一-龥぀-ゟ゠-ヿ]+
+/// [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+/// |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+/// | ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// ```
+///
+/// matched by hand. (llama.cpp's own matcher folds the letter classes into
+/// `\p{L}`, which splits a word like `camelCase` differently.)
+fn flint_split(text: &str, mut f: impl FnMut(&str)) {
+    let number = |c: char| class(c) == Class::Number;
+    let cjk = |c: char| matches!(c, '\u{4e00}'..='\u{9fa5}' | '\u{3040}'..='\u{30ff}');
+    let mut rest = text;
+    while !rest.is_empty() {
+        // up to 3 digits, or the text up to the next digit
+        let len = if rest.starts_with(number) {
+            let digits = run(rest, 0, number);
+            rest[..digits]
+                .char_indices()
+                .nth(3)
+                .map_or(digits, |(i, _)| i)
+        } else {
+            run(rest, 0, |c| !number(c))
+        };
+        let (piece, tail) = rest.split_at(len);
+        rest = tail;
+        if piece.starts_with(number) {
+            // no alternative of the last split matches a digit
+            f(piece);
+            continue;
+        }
+        let mut rest = piece;
+        while !rest.is_empty() {
+            let c = rest.starts_with(cjk);
+            let len = run(rest, 0, |ch| cjk(ch) == c);
+            let (piece, tail) = rest.split_at(len);
+            rest = tail;
+            flint_words(piece, &mut f);
+        }
+    }
+}
+
+/// The last split of [`flint_split`]
+fn flint_words(s: &str, f: &mut impl FnMut(&str)) {
+    let (mut pos, mut gap) = (0, 0);
+    while pos < s.len() {
+        match flint_match(&s[pos..]) {
+            Some(len) => {
+                if gap < pos {
+                    f(&s[gap..pos]);
+                }
+                f(&s[pos..pos + len]);
+                pos += len;
+                gap = pos;
+            }
+            None => pos += s[pos..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    if gap < pos {
+        f(&s[gap..]);
+    }
+}
+
+/// The classes of the flint regex
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flint {
+    /// `\p{Lu}`, `\p{Lt}`
+    Upper,
+    /// `\p{Ll}`
+    Lower,
+    /// `\p{Lm}`, `\p{Lo}`, `\p{M}`: in both letter sets
+    Both,
+    Number,
+    Space,
+    /// `\p{P}`, `\p{S}`
+    Punct,
+    Other,
+}
+
+fn flint_class(c: char) -> Flint {
+    use unicode_properties::GeneralCategory as G;
+    if c.is_ascii() {
+        return match c {
+            'a'..='z' => Flint::Lower,
+            'A'..='Z' => Flint::Upper,
+            '0'..='9' => Flint::Number,
+            '\t'..='\r' | ' ' => Flint::Space,
+            '!'..='~' => Flint::Punct,
+            _ => Flint::Other,
+        };
+    }
+    if c.is_whitespace() {
+        return Flint::Space;
+    }
+    match c.general_category() {
+        G::UppercaseLetter | G::TitlecaseLetter => Flint::Upper,
+        G::LowercaseLetter => Flint::Lower,
+        G::ModifierLetter | G::OtherLetter => Flint::Both,
+        _ => match c.general_category_group() {
+            GeneralCategoryGroup::Mark => Flint::Both,
+            GeneralCategoryGroup::Number => Flint::Number,
+            GeneralCategoryGroup::Punctuation | GeneralCategoryGroup::Symbol => Flint::Punct,
+            _ => Flint::Other,
+        },
+    }
+}
+
+/// Byte length of the match of the flint word regex at the start of `s`, if any
+fn flint_match(s: &str) -> Option<usize> {
+    use Flint::*;
+    let c0 = s.chars().next()?;
+    let k0 = flint_class(c0);
+    let upper = |c| matches!(flint_class(c), Upper | Both);
+    let lower = |c| matches!(flint_class(c), Lower | Both);
+    // [^\r\n\p{L}\p{N}]?, taken first
+    let prefixes: &[usize] =
+        if !matches!(c0, '\r' | '\n') && !matches!(k0, Upper | Lower | Both | Number) {
+            &[c0.len_utf8(), 0]
+        } else {
+            &[0]
+        };
+    // [upper]*[lower]+: the upper run, given back a char at a time
+    for &p in prefixes {
+        let mut k = run(s, p, upper);
+        loop {
+            let end = run(s, k, lower);
+            if end > k {
+                return Some(contraction(s, end));
+            }
+            if k == p {
+                break;
+            }
+            k -= s[..k].chars().next_back().map_or(1, char::len_utf8);
+        }
+    }
+    // [upper]+[lower]*
+    for &p in prefixes {
+        let k = run(s, p, upper);
+        if k > p {
+            return Some(contraction(s, run(s, k, lower)));
+        }
+    }
+    // ' ?[\p{P}\p{S}]+[\r\n]*'
+    let start = (c0 == ' ') as usize;
+    let end = run(s, start, |c| flint_class(c) == Punct);
+    if end > start {
+        return Some(run(s, end, |c| matches!(c, '\r' | '\n')));
+    }
+    if k0 != Space {
+        return None;
+    }
+    // \s*[\r\n]+|\s+(?!\S)|\s+, as in [`piece_len`]
+    let ws = run(s, 0, |c| flint_class(c) == Space);
+    if let Some(nl) = s[..ws].rfind(['\r', '\n']) {
+        return Some(nl + 1);
+    }
+    let last = s[..ws].chars().next_back().map_or(0, char::len_utf8);
+    Some(if ws == s.len() || ws == last {
+        ws
+    } else {
+        ws - last
+    })
+}
+
+/// `at`, past a following `(?i:'s|'t|'re|'ve|'m|'ll|'d)` if any
+fn contraction(s: &str, at: usize) -> usize {
+    let mut c = s[at..].chars();
+    if c.next() != Some('\'') {
+        return at;
+    }
+    let fold = |c: Option<char>| {
+        c.map(|c| {
+            if c == '\u{17f}' {
+                's'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+    };
+    match (fold(c.next()), fold(c.next())) {
+        (Some('s'), _) => at + 1 + s[at + 1..].chars().next().map_or(1, char::len_utf8),
+        (Some('t' | 'm' | 'd'), _) => at + 2,
+        (Some('r' | 'v'), Some('e')) | (Some('l'), Some('l')) => at + 3,
+        _ => at,
+    }
+}
+
 /// Turns a stream of tokens into text, holding back incomplete UTF-8 sequences
 #[derive(Default)]
 pub struct StreamDecoder {
@@ -737,6 +958,83 @@ mod tests {
 
     /// The regex the pre-tokenizer implements, as llama.cpp has it
     const QWEN35_PRE: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    /// The splits of the flint pre-tokenizer, as in its `tokenizer.json`
+    const FLINT_PRE: [&str; 3] = [
+        r"\p{N}{1,3}",
+        r"[一-龥぀-ゟ゠-ヿ]+",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    ];
+
+    /// Each regex in turn splits each piece into its matches and the text between
+    fn flint_by_regex<'a>(res: &[fancy_regex::Regex], text: &'a str) -> Vec<&'a str> {
+        let mut pieces = vec![text];
+        for re in res {
+            let mut next = Vec::new();
+            for p in pieces {
+                let mut at = 0;
+                for m in re.find_iter(p) {
+                    let m = m.unwrap();
+                    if at < m.start() {
+                        next.push(&p[at..m.start()]);
+                    }
+                    next.push(m.as_str());
+                    at = m.end();
+                }
+                if at < p.len() {
+                    next.push(&p[at..]);
+                }
+            }
+            pieces = next;
+        }
+        pieces
+    }
+
+    #[test]
+    fn flint_split_matches_regex() {
+        let res: Vec<_> = FLINT_PRE
+            .iter()
+            .map(|r| fancy_regex::Regex::new(r).unwrap())
+            .collect();
+        let check = |text: &str| {
+            let want = flint_by_regex(&res, text);
+            let mut got: Vec<String> = Vec::new();
+            flint_split(text, |p| got.push(p.into()));
+            assert_eq!(got, want, "split of {text:?}");
+        };
+        for text in [
+            "",
+            "Hello world! It's 2026, isn't it?   ok\n\n  x",
+            "parseHttpServerConfig HTTPServer iPhone ABCdef DON'T we'LL 'S",
+            "1234567 ½² x1y22z333w4444",
+            "日本語のテキストとカタカナ・ー中文abc 한국어",
+            "e\u{301}t\u{e9} \u{301}x नमस्ते ١٢٣ Ⅻ 🦀 ǅx ʰa",
+            "  \t\n \r\n  trailing   ",
+            "\u{0}\u{0}a \u{200d}\u{200d} b\u{feff}",
+        ] {
+            check(text);
+        }
+        let pool = [
+            "a", "Z", "é", "É", "e\u{301}", "\u{301}", "ß", "ǅ", "ʰ", "ª", "中", "の", "ア", "ー",
+            "・", "゛", "゠", "한", "😀", "👍🏽", "\u{200d}", "\u{feff}", "\u{e000}", "0", "9", "½",
+            "Ⅻ", "٣", "²", "क", "ि", "्", " ", "  ", "\t", "\n", "\r", "\r\n", "\u{a0}", "\u{3000}",
+            "\u{2028}", "\u{85}", "\u{b}", "\u{0}", "\u{1f}", "'", "'s", "'S", "'ſ", "'re", "'VE",
+            "'lL", "'d", "'m", "'t", "'x", "'r", "'l", ".", ",", "!", "-", "_", "(", "\"", "/",
+            "$", "€", "+", "^", "`", "<|user|>",
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..50_000 {
+            let len = 1 + rand(12);
+            let text: String = (0..len).map(|_| pool[rand(pool.len())]).collect();
+            check(&text);
+        }
+    }
 
     fn check(re: &fancy_regex::Regex, text: &str) {
         let want: Vec<&str> = re.find_iter(text).map(|m| m.unwrap().as_str()).collect();

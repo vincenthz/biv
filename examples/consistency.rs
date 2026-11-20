@@ -10,7 +10,7 @@ fn main() {
     let ids = tok.encode(text);
     println!("{} tokens", ids.len());
     let run = |chunk: usize| {
-        let mut st = model.new_state(ids.len(), false).unwrap();
+        let mut st = model.new_state(ids.len(), 0).unwrap();
         let (body, last) = ids.split_at(ids.len() - 1);
         for c in body.chunks(chunk) {
             model.prefill(&mut st, c);

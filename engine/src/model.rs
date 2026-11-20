@@ -1,14 +1,22 @@
-//! Qwen3.5 / Qwen3.8 hybrid decoder (llama.cpp archs `qwen35` and
-//! `qwen35moe`).
+//! The decoders of the llama.cpp archs `qwen35` and `qwen35moe` (Qwen3.5 /
+//! Qwen3.8), and `flint`.
 //!
-//! Ported from llama.cpp `src/models/qwen35.cpp`, `qwen35moe.cpp` and
-//! `delta-net-base.cpp`.
-//! Every `full_attention_interval`-th layer is gated full attention (GQA,
-//! partial NeoX rope, sigmoid output gate); the others are Gated DeltaNet
-//! linear attention with a short causal conv and a recurrent state. The
-//! feed-forward is dense, or a mixture of experts: a router picks the top-k
-//! experts of each token, whose SwiGLU outputs are summed with their
+//! Ported from llama.cpp `src/models/qwen35.cpp`, `qwen35moe.cpp`,
+//! `delta-net-base.cpp` and `flint.cpp`.
+//!
+//! `qwen35`: every `full_attention_interval`-th layer is gated full attention
+//! (GQA, partial NeoX rope, sigmoid output gate); the others are Gated
+//! DeltaNet linear attention with a short causal conv and a recurrent state.
+//! The feed-forward is dense, or a mixture of experts: a router picks the
+//! top-k experts of each token, whose SwiGLU outputs are summed with their
 //! weights, plus a shared expert behind a sigmoid gate.
+//!
+//! `flint`: every layer is attention (GQA, QK norm), over a sliding window
+//! of the last positions with NeoX rope, or over all of them without
+//! positional encoding, as the GGUF's patterns say; each head has a learned
+//! sink, a logit in its softmax that no value goes with. The first layers'
+//! feed-forwards are dense, the others a mixture of experts routed by
+//! sigmoid, plus a shared expert without a gate.
 //!
 //! The MTP (next-n) block stored after the trunk drafts tokens for
 //! speculative decoding: [`Model::draft`] proposes, [`Model::verify`] runs
@@ -27,8 +35,27 @@ use crate::quant::{self, GgmlType};
 use crate::tokenizer::TokenId;
 use alloc::collections::VecDeque;
 
+/// The llama.cpp architecture of a model
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    Qwen35,
+    Qwen35Moe,
+    Flint,
+}
+
+impl Arch {
+    pub fn name(self) -> &'static str {
+        match self {
+            Arch::Qwen35 => "qwen35",
+            Arch::Qwen35Moe => "qwen35moe",
+            Arch::Flint => "flint",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub arch: Arch,
     pub n_layer: usize,
     pub n_embd: usize,
     pub n_ff: usize,
@@ -40,20 +67,43 @@ pub struct Config {
     pub rope_base: f32,
     pub eps: f32,
     pub context_length: usize,
-    /// per layer: gated delta net (true) or full attention (false)
+    /// per layer: gated delta net (true) or attention (false)
     pub recurrent: Vec<bool>,
+    /// per layer: whether its attention sees the last `sliding_window`
+    /// positions only (false for the delta nets)
+    pub swa: Vec<bool>,
+    /// positions a sliding window layer sees, its token's included
+    pub sliding_window: usize,
+    /// per layer: whether its attention has rotary embeddings
+    pub rope: Vec<bool>,
+    /// whether the query projection has a sigmoid output gate per head,
+    /// interleaved with the queries (`qwen35`)
+    pub attn_gate: bool,
+    /// whether each attention head has a sink logit (`flint`)
+    pub attn_sinks: bool,
     pub conv_kernel: usize,
     /// key/value head size of the delta net
     pub ssm_state: usize,
     pub ssm_k_heads: usize,
     pub ssm_v_heads: usize,
-    /// the mixture of experts feed-forwards of `qwen35moe`, instead of dense ones
+    /// the mixture of experts feed-forwards, instead of dense ones but for
+    /// the first `n_dense_lead` layers
     pub moe: Option<MoeConfig>,
+    pub n_dense_lead: usize,
+}
+
+/// How the router's logits become the experts' probabilities
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gating {
+    Softmax,
+    Sigmoid,
 }
 
 /// A mixture of experts: each token goes through the `n_expert_used` experts
-/// of highest softmax router probability, weighted by these probabilities
-/// over their sum, and through the shared expert, gated by a sigmoid
+/// of highest router probability (plus a bias, when the layers have one),
+/// weighted by these probabilities, over their sum when `norm_weights`, times
+/// `weights_scale`; and through the shared expert, gated by a sigmoid when
+/// `shared_gate`
 #[derive(Debug, Clone)]
 pub struct MoeConfig {
     pub n_expert: usize,
@@ -63,87 +113,169 @@ pub struct MoeConfig {
     pub n_ff_exp: usize,
     /// width of the shared expert's, 0 without one
     pub n_ff_shexp: usize,
+    pub gating: Gating,
+    pub norm_weights: bool,
+    pub weights_scale: f32,
+    pub shared_gate: bool,
 }
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self, Error> {
         let m = &g.metadata;
-        let arch = need!(m, general.architecture)?.as_str();
-        let q = match arch {
-            "qwen35" => &m.qwen35,
-            "qwen35moe" => &m.qwen35moe,
-            _ => return Err(Error::UnsupportedArchitecture(arch.into())),
+        let name = need!(m, general.architecture)?.as_str();
+        let (arch, q) = match name {
+            "qwen35" => (Arch::Qwen35, &m.qwen35),
+            "qwen35moe" => (Arch::Qwen35Moe, &m.qwen35moe),
+            "flint" => (Arch::Flint, &m.flint),
+            _ => return Err(Error::UnsupportedArchitecture(name.into())),
         };
+        let arch_name = name;
         let u = |v: Option<u64>| v.map(|v| v as usize);
         let need = |v: Result<&u64, Error>| v.map(|&v| v as usize);
 
-        let block_count = need(need!(q, @arch, block_count))?;
+        let block_count = need(need!(q, @arch_name, block_count))?;
         let nextn = u(q.nextn_predict_layers).unwrap_or(0);
         let n_layer = block_count - nextn;
-        let n_embd = need(need!(q, @arch, embedding_length))?;
-        let n_head = need(need!(q, @arch, attention.head_count))?;
+        let n_embd = need(need!(q, @arch_name, embedding_length))?;
+        let n_head = need(need!(q, @arch_name, attention.head_count))?;
         let head_dim = u(q.attention.key_length).unwrap_or(n_embd / n_head);
         if u(q.attention.value_length).unwrap_or(head_dim) != head_dim {
             return Err(Error::UnsupportedModel("key_length != value_length"));
         }
-        let recurrent = match &q.attention.recurrent_layers {
-            Some(a) => a.iter().take(n_layer).copied().collect(),
-            None => {
-                let interval = u(q.full_attention_interval).unwrap_or(4);
-                (0..n_layer).map(|i| (i + 1) % interval != 0).collect()
+        let n_vocab = tensor!(g.tensors, token_embd.weight)?.dims[1] as usize;
+        // a per-layer pattern, of at least `n_layer` layers
+        let pattern = |p: &Option<Vec<bool>>, key: &str| -> Result<Vec<bool>, Error> {
+            match p {
+                Some(a) if a.len() >= n_layer => Ok(a[..n_layer].to_vec()),
+                Some(_) => Err(Error::UnsupportedModel(match key {
+                    "rope" => "rope_pattern shorter than block_count",
+                    _ => "sliding_window_pattern shorter than block_count",
+                })),
+                None => Err(Error::MissingKey(format!(
+                    "{arch_name}.attention.{key}_pattern"
+                ))),
             }
         };
-        let ssm_state = need(need!(q, @arch, ssm.state_size))?;
-        let ssm_v_heads = need(need!(q, @arch, ssm.time_step_rank))?;
-        if need(need!(q, @arch, ssm.inner_size))? != ssm_state * ssm_v_heads {
-            return Err(Error::UnsupportedModel(
-                "ssm.inner_size != state_size * time_step_rank",
-            ));
-        }
-        let n_vocab = tensor!(g.tensors, token_embd.weight)?.dims[1] as usize;
 
-        let moe = if arch == "qwen35moe" {
-            let n_expert = need(need!(q, @arch, expert_count))?;
-            let n_expert_used = need(need!(q, @arch, expert_used_count))?;
+        let mut cfg = Config {
+            arch,
+            n_layer,
+            n_embd,
+            n_ff: 0,
+            n_vocab,
+            n_head,
+            n_head_kv: need(need!(q, @arch_name, attention.head_count_kv))?,
+            head_dim,
+            n_rot: u(q.rope.dimension_count).unwrap_or(head_dim),
+            rope_base: q.rope.freq_base.unwrap_or(10_000.0),
+            eps: *need!(q, @arch_name, attention.layer_norm_rms_epsilon)?,
+            context_length: u(q.context_length).unwrap_or(4096),
+            recurrent: vec![false; n_layer],
+            swa: vec![false; n_layer],
+            sliding_window: 0,
+            rope: vec![true; n_layer],
+            attn_gate: arch != Arch::Flint,
+            attn_sinks: arch == Arch::Flint,
+            conv_kernel: 0,
+            ssm_state: 0,
+            ssm_k_heads: 0,
+            ssm_v_heads: 0,
+            moe: None,
+            n_dense_lead: 0,
+        };
+
+        if arch == Arch::Flint {
+            cfg.swa = pattern(&q.attention.sliding_window_pattern, "sliding_window")?;
+            cfg.rope = pattern(&q.attention.rope_pattern, "rope")?;
+            cfg.sliding_window = need(need!(q, @arch_name, attention.sliding_window))?;
+            if cfg.sliding_window == 0 && cfg.swa.contains(&true) {
+                return Err(Error::UnsupportedModel("sliding window of 0 positions"));
+            }
+            cfg.n_dense_lead = u(q.leading_dense_block_count).unwrap_or(0).min(n_layer);
+        } else {
+            cfg.recurrent = match &q.attention.recurrent_layers {
+                Some(a) => a.iter().take(n_layer).copied().collect(),
+                None => {
+                    let interval = u(q.full_attention_interval).unwrap_or(4);
+                    (0..n_layer).map(|i| (i + 1) % interval != 0).collect()
+                }
+            };
+            cfg.ssm_state = need(need!(q, @arch_name, ssm.state_size))?;
+            cfg.ssm_v_heads = need(need!(q, @arch_name, ssm.time_step_rank))?;
+            if need(need!(q, @arch_name, ssm.inner_size))? != cfg.ssm_state * cfg.ssm_v_heads {
+                return Err(Error::UnsupportedModel(
+                    "ssm.inner_size != state_size * time_step_rank",
+                ));
+            }
+            cfg.conv_kernel = need(need!(q, @arch_name, ssm.conv_kernel))?;
+            cfg.ssm_k_heads = need(need!(q, @arch_name, ssm.group_count))?;
+        }
+
+        if arch != Arch::Qwen35 {
+            let n_expert = need(need!(q, @arch_name, expert_count))?;
+            let n_expert_used = need(need!(q, @arch_name, expert_used_count))?;
             if n_expert_used == 0 || n_expert_used > n_expert {
                 return Err(Error::UnsupportedModel(
                     "expert_used_count not in 1..=expert_count",
                 ));
             }
-            Some(MoeConfig {
+            // qwen35moe: softmax, the weights normalized
+            let gating = match q.expert_gating_func {
+                None | Some(1) => Gating::Softmax,
+                Some(2) => Gating::Sigmoid,
+                Some(_) => return Err(Error::UnsupportedModel("expert_gating_func not 1 or 2")),
+            };
+            cfg.moe = Some(MoeConfig {
                 n_expert,
                 n_expert_used,
-                n_ff_exp: need(need!(q, @arch, expert_feed_forward_length))?,
+                n_ff_exp: need(need!(q, @arch_name, expert_feed_forward_length))?,
                 n_ff_shexp: u(q.expert_shared_feed_forward_length).unwrap_or(0),
-            })
-        } else {
-            None
+                gating,
+                norm_weights: q.expert_weights_norm.unwrap_or(arch == Arch::Qwen35Moe),
+                weights_scale: q.expert_weights_scale.filter(|&s| s != 0.0).unwrap_or(1.0),
+                shared_gate: arch == Arch::Qwen35Moe,
+            });
+        }
+        // a mixture of experts has no dense feed-forward, but in its leading layers
+        cfg.n_ff = match cfg.moe {
+            Some(_) if cfg.n_dense_lead == 0 => u(q.feed_forward_length).unwrap_or(0),
+            _ => need(need!(q, @arch_name, feed_forward_length))?,
         };
-        // a mixture of experts has no dense feed-forward
-        let n_ff = match moe {
-            Some(_) => u(q.feed_forward_length).unwrap_or(0),
-            None => need(need!(q, @arch, feed_forward_length))?,
-        };
+        Ok(cfg)
+    }
 
-        Ok(Config {
-            n_layer,
-            n_embd,
-            n_ff,
-            n_vocab,
-            n_head,
-            n_head_kv: need(need!(q, @arch, attention.head_count_kv))?,
-            head_dim,
-            n_rot: u(q.rope.dimension_count).unwrap_or(head_dim),
-            rope_base: q.rope.freq_base.unwrap_or(10_000.0),
-            eps: *need!(q, @arch, attention.layer_norm_rms_epsilon)?,
-            context_length: u(q.context_length).unwrap_or(4096),
-            recurrent,
-            conv_kernel: need(need!(q, @arch, ssm.conv_kernel))?,
-            ssm_state,
-            ssm_k_heads: need(need!(q, @arch, ssm.group_count))?,
-            ssm_v_heads,
-            moe,
-        })
+    /// Whether layer `i` (the MTP head's, past the trunk) attends over the
+    /// sliding window only
+    pub fn is_swa(&self, i: usize) -> bool {
+        self.swa.get(i).copied().unwrap_or(false)
+    }
+
+    /// Whether layer `i` (the MTP head's, past the trunk) has rotary embeddings
+    pub fn has_rope(&self, i: usize) -> bool {
+        self.rope.get(i).copied().unwrap_or(true)
+    }
+
+    /// Whether layer `i` (the MTP head's, past the trunk) has a dense
+    /// feed-forward
+    pub fn is_dense(&self, i: usize) -> bool {
+        self.moe.is_none() || i < self.n_dense_lead
+    }
+
+    /// Floats per position of a kv cache, keys or values
+    pub fn kv_dim(&self) -> usize {
+        self.n_head_kv * self.head_dim
+    }
+
+    /// Positions the CPU caches of a sliding window layer hold, for a
+    /// session of `context` tokens whose verify passes take `draft` tokens
+    /// after the chosen one: the window but the next token's own position,
+    /// and the positions a verify pass writes, the rejected ones too. A pass
+    /// writes its rows after its scores, which read its own rows elsewhere.
+    pub fn cpu_ring(&self, context: usize, draft: usize) -> usize {
+        self.sliding_window
+            .saturating_add(draft)
+            .min(context)
+            .max(1)
     }
 
     /// width of the conv / qkv projection of the delta net: q, k, v
@@ -157,13 +289,20 @@ impl Config {
 }
 
 pub(crate) struct Attention<'a> {
-    /// query and output gate, interleaved per head: `[q(head_dim), gate(head_dim)] * n_head`
+    /// the queries, or with [`Config::attn_gate`] query and output gate
+    /// interleaved per head: `[q(head_dim), gate(head_dim)] * n_head`
     pub(crate) wq: Weight<'a>,
     pub(crate) wk: Weight<'a>,
     pub(crate) wv: Weight<'a>,
     pub(crate) wo: Weight<'a>,
     pub(crate) q_norm: Vec<f32>,
     pub(crate) k_norm: Vec<f32>,
+    /// a logit per head in the softmax of its scores, no value with it
+    pub(crate) sinks: Option<Vec<f32>>,
+    /// rotary embeddings of the queries and keys
+    pub(crate) rope: bool,
+    /// positions a token sees, its own included, when not all before it
+    pub(crate) window: Option<usize>,
 }
 
 pub(crate) struct DeltaNet<'a> {
@@ -216,20 +355,22 @@ impl<'a> Experts<'a> {
     }
 }
 
-/// A feed-forward of the experts' shape every token goes through, its output
-/// scaled by `sigmoid(gate_inp · x)`
+/// A feed-forward every token goes through, its output scaled by
+/// `sigmoid(gate_inp · x)` when it has a gate
 pub(crate) struct SharedExpert<'a> {
     pub(crate) gate: Weight<'a>,
     pub(crate) up: Weight<'a>,
     pub(crate) down: Weight<'a>,
     /// one row
-    pub(crate) gate_inp: Weight<'a>,
+    pub(crate) gate_inp: Option<Weight<'a>>,
 }
 
 /// A mixture of experts feed-forward, see [`MoeConfig`]
 pub(crate) struct Moe<'a> {
     /// the experts' logits of a token
     pub(crate) router: Weight<'a>,
+    /// added to the probabilities to choose the experts, not to weigh them
+    pub(crate) bias: Option<Vec<f32>>,
     pub(crate) gate: Experts<'a>,
     pub(crate) up: Experts<'a>,
     pub(crate) down: Experts<'a>,
@@ -253,17 +394,36 @@ pub(crate) struct Layer<'a> {
     pub(crate) ffn: Ffn<'a>,
 }
 
-/// The `k` experts of highest probability, from a token's router logits,
-/// and their weights: the probabilities over their sum. In order of
-/// probability, the lowest index first among equals.
-pub(crate) fn route(logits: &[f32], k: usize) -> (Vec<usize>, Vec<f32>) {
+/// The `n_expert_used` experts of highest probability (plus `bias`), from a
+/// token's router logits, and their weights: the probabilities, over their
+/// sum when [`MoeConfig::norm_weights`], scaled. In order of probability plus
+/// bias, the lowest index first among equals.
+pub(crate) fn route(logits: &[f32], m: &MoeConfig, bias: Option<&[f32]>) -> (Vec<usize>, Vec<f32>) {
     let mut p = logits.to_vec();
-    ops::softmax(&mut p);
+    match m.gating {
+        Gating::Softmax => ops::softmax(&mut p),
+        Gating::Sigmoid => p.iter_mut().for_each(|x| *x = ops::sigmoid(*x)),
+    }
+    let score = |i: usize| p[i] + bias.map_or(0.0, |b| b[i]);
     let mut ids: Vec<usize> = (0..p.len()).collect();
-    ids.sort_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
-    ids.truncate(k);
-    let sum = ids.iter().map(|&i| p[i]).sum::<f32>().max(1.0 / 16384.0);
-    let w = ids.iter().map(|&i| p[i] / sum).collect();
+    ids.sort_by(|&a, &b| score(b).total_cmp(&score(a)).then(a.cmp(&b)));
+    ids.truncate(m.n_expert_used);
+    let sum = if m.norm_weights {
+        ids.iter().map(|&i| p[i]).sum::<f32>().max(1.0 / 16384.0)
+    } else {
+        1.0
+    };
+    let scale = m.weights_scale;
+    let w = ids
+        .iter()
+        .map(|&i| {
+            if scale == 1.0 {
+                p[i] / sum
+            } else {
+                p[i] / sum * scale
+            }
+        })
+        .collect();
     (ids, w)
 }
 
@@ -378,7 +538,7 @@ impl<'g> Loader<'g> {
         let l = self;
         let e = cfg.n_embd;
         let t = &self.g.tensors;
-        let Some(moe) = &cfg.moe else {
+        let Some(moe) = cfg.moe.as_ref().filter(|_| !cfg.is_dense(i)) else {
             return Ok(Ffn::Dense {
                 gate: l.weight(tensor!(t, blk[i].ffn_gate.weight), e, cfg.n_ff)?,
                 up: l.weight(tensor!(t, blk[i].ffn_up.weight), e, cfg.n_ff)?,
@@ -408,11 +568,20 @@ impl<'g> Loader<'g> {
                 gate: l.weight(tensor!(t, blk[i].ffn_gate_shexp.weight), e, sff)?,
                 up: l.weight(tensor!(t, blk[i].ffn_up_shexp.weight), e, sff)?,
                 down: l.weight(tensor!(t, blk[i].ffn_down_shexp.weight), sff, e)?,
-                gate_inp: l.row(tensor!(t, blk[i].ffn_gate_inp_shexp.weight), e)?,
+                gate_inp: if moe.shared_gate {
+                    Some(l.row(tensor!(t, blk[i].ffn_gate_inp_shexp.weight), e)?)
+                } else {
+                    None
+                },
             }),
+        };
+        let bias = match tensor!(t, blk[i].exp_probs_b.bias) {
+            Ok(info) => Some(l.vec(Ok(info), n)?),
+            Err(_) => None,
         };
         Ok(Ffn::Moe(Box::new(Moe {
             router: l.weight(tensor!(t, blk[i].ffn_gate_inp.weight), e, n)?,
+            bias,
             gate,
             up,
             down: l.experts(tensor!(t, blk[i].ffn_down_exps.weight), ff, e, n)?,
@@ -462,18 +631,31 @@ impl<'g> Loader<'g> {
                 wout: l.weight(tensor!(t, blk[i].ssm_out.weight), d_inner, e)?,
             })
         } else {
+            let q_rows = if cfg.attn_gate { 2 } else { 1 } * hd * cfg.n_head;
             Mixer::Attention(Attention {
-                wq: l.weight(tensor!(t, blk[i].attn_q.weight), e, 2 * hd * cfg.n_head)?,
+                wq: l.weight(tensor!(t, blk[i].attn_q.weight), e, q_rows)?,
                 wk: l.weight(tensor!(t, blk[i].attn_k.weight), e, hd * cfg.n_head_kv)?,
                 wv: l.weight(tensor!(t, blk[i].attn_v.weight), e, hd * cfg.n_head_kv)?,
                 wo: l.weight(tensor!(t, blk[i].attn_output.weight), hd * cfg.n_head, e)?,
                 q_norm: l.vec(tensor!(t, blk[i].attn_q_norm.weight), hd)?,
                 k_norm: l.vec(tensor!(t, blk[i].attn_k_norm.weight), hd)?,
+                sinks: if cfg.attn_sinks {
+                    Some(l.vec(tensor!(t, blk[i].attn_sinks.weight), cfg.n_head)?)
+                } else {
+                    None
+                },
+                rope: cfg.has_rope(i),
+                window: cfg.is_swa(i).then_some(cfg.sliding_window),
             })
+        };
+        // the norm before the feed-forward, as each architecture names it
+        let post_norm = match cfg.arch {
+            Arch::Flint => tensor!(t, blk[i].ffn_norm.weight),
+            _ => tensor!(t, blk[i].post_attention_norm.weight),
         };
         Ok(Layer {
             attn_norm: l.vec(tensor!(t, blk[i].attn_norm.weight), e)?,
-            post_norm: l.vec(tensor!(t, blk[i].post_attention_norm.weight), e)?,
+            post_norm: l.vec(post_norm, e)?,
             mixer,
             ffn: l.ffn(cfg, i)?,
         })
@@ -542,10 +724,11 @@ impl<'a> Model<'a> {
     }
 
     /// An empty sequence able to hold `context` tokens, its memory allocated
-    /// up front; with `mtp`, the MTP head follows it to draft tokens
-    pub fn new_state(&self, context: usize, mtp: bool) -> Result<State, Error> {
+    /// up front, whose verify passes take up to `draft` tokens after the
+    /// chosen one; with `draft` > 0, the MTP head follows it to draft tokens
+    pub fn new_state(&self, context: usize, draft: usize) -> Result<State, Error> {
         let c = &self.cfg;
-        let kv_dim = c.head_dim * c.n_head_kv;
+        let kv_dim = c.kv_dim();
         let kv = || -> Result<_, Error> {
             // an absurd context fails to allocate rather than wrap around
             let n = context.saturating_mul(kv_dim);
@@ -554,19 +737,26 @@ impl<'a> Model<'a> {
                 v: reserved(n)?,
             })
         };
+        let ring = c.cpu_ring(context, draft);
         let mut layers = Vec::with_capacity(c.n_layer);
-        for &r in &c.recurrent {
+        for (i, &r) in c.recurrent.iter().enumerate() {
             layers.push(if r {
                 LayerState::DeltaNet {
                     conv: zeroed((c.conv_kernel - 1) * c.conv_dim())?,
                     s: zeroed(c.ssm_v_heads * c.ssm_state * c.ssm_state)?,
                     saved: Vec::new(),
                 }
+            } else if c.is_swa(i) {
+                LayerState::Window {
+                    k: zeroed(ring * kv_dim)?,
+                    v: zeroed(ring * kv_dim)?,
+                    ring,
+                }
             } else {
                 kv()?
             });
         }
-        let mtp = if mtp && self.has_mtp() {
+        let mtp = if draft > 0 && self.has_mtp() {
             let head = match DraftVocab::new(c.n_vocab) {
                 Some(vocab) => {
                     let rb = self.output.data.len() / self.output.rows;
@@ -594,15 +784,15 @@ impl<'a> Model<'a> {
             layers,
             n_past: 0,
             context,
+            draft,
             kv_dim,
+            window: c.sliding_window,
             mtp,
             verify: None,
         };
         debug_assert_eq!(
             state.memory().allocated(),
-            self.shape()
-                .cpu_session(context, state.mtp.is_some() as usize, 1)
-                .allocated()
+            self.shape().cpu_session(context, draft, 1).allocated()
         );
         Ok(state)
     }
@@ -708,6 +898,12 @@ impl<'a> Model<'a> {
             "context overflow ({pos0} + {n} > {})",
             state.context
         );
+        // the rings of the sliding windows hold the rejected tokens' rows too
+        assert!(
+            pass != Pass::Verify || n <= state.draft + 1,
+            "verify of {n} tokens, {} at most",
+            state.draft + 1
+        );
 
         if let Some((vocab, rows)) = state.mtp.as_mut().and_then(|m| m.head.as_mut()) {
             let added = vocab.observe(tokens, if pass == Pass::Verify { 1 } else { n });
@@ -773,10 +969,13 @@ impl<'a> Model<'a> {
         let mixed = match (&layer.mixer, ls) {
             (Mixer::Attention(a), LayerState::Attention { k, v }) => {
                 // drop positions left over from rejected tokens
-                let kv_dim = c.head_dim * c.n_head_kv;
+                let kv_dim = c.kv_dim();
                 k.truncate(pos0 * kv_dim);
                 v.truncate(pos0 * kv_dim);
-                self.attention(a, &h, n, pos0, k, v)
+                self.attention(a, &h, n, pos0, Cache::Full { k, v })
+            }
+            (Mixer::Attention(a), LayerState::Window { k, v, ring }) => {
+                self.attention(a, &h, n, pos0, Cache::Ring { k, v, ring: *ring })
             }
             (Mixer::DeltaNet(d), LayerState::DeltaNet { conv, s, saved }) => {
                 self.delta_net(d, &h, n, conv, s, save.then_some(saved))
@@ -860,13 +1059,13 @@ impl<'a> Model<'a> {
     /// Each token through its experts, each expert over its tokens at once
     fn moe(&self, m: &Moe<'_>, h: &[f32], n: usize) -> Vec<f32> {
         let e = self.cfg.n_embd;
-        let k = self.cfg.moe.as_ref().expect("a moe config").n_expert_used;
+        let mc = self.cfg.moe.as_ref().expect("a moe config");
         let input = Input::new(h, n);
         let logits = matmul_new(&m.router, &input);
         // the (token, weight) pairs of each expert
         let mut routed: Vec<Vec<(usize, f32)>> = vec![Vec::new(); m.gate.n];
         for (t, l) in logits.chunks_exact(m.gate.n).enumerate() {
-            let (ids, w) = route(l, k);
+            let (ids, w) = route(l, mc, m.bias.as_deref());
             for (i, w) in ids.into_iter().zip(w) {
                 routed[i].push((t, w));
             }
@@ -889,9 +1088,14 @@ impl<'a> Model<'a> {
         }
         if let Some(s) = &m.shared {
             let y = dense_ffn(&s.gate, &s.up, &s.down, &input);
-            let g = matmul_new(&s.gate_inp, &input);
-            for ((o, y), g) in out.chunks_exact_mut(e).zip(y.chunks_exact(e)).zip(g) {
-                quant::axpy(o, ops::sigmoid(g), y);
+            match &s.gate_inp {
+                Some(gate_inp) => {
+                    let g = matmul_new(gate_inp, &input);
+                    for ((o, y), g) in out.chunks_exact_mut(e).zip(y.chunks_exact(e)).zip(g) {
+                        quant::axpy(o, ops::sigmoid(g), y);
+                    }
+                }
+                None => ops::add_inplace(&mut out, &y),
             }
         }
         out
@@ -903,68 +1107,113 @@ impl<'a> Model<'a> {
         h: &[f32],
         n: usize,
         n_past: usize,
-        k_cache: &mut Vec<f32>,
-        v_cache: &mut Vec<f32>,
+        cache: Cache<'_>,
     ) -> Vec<f32> {
         let c = &self.cfg;
         let hd = c.head_dim;
-        let kv_dim = hd * c.n_head_kv;
+        let kv_dim = c.kv_dim();
         let input = Input::new(h, n);
         let qg = matmul_new(&a.wq, &input);
         let mut k = matmul_new(&a.wk, &input);
         let v = matmul_new(&a.wv, &input);
 
         // split the joint projection into query and gate, per head
-        let mut q = vec![0.0f32; n * c.n_head * hd];
-        let mut gate = vec![0.0f32; n * c.n_head * hd];
-        for (i, pair) in qg.chunks_exact(2 * hd).enumerate() {
-            q[i * hd..(i + 1) * hd].copy_from_slice(&pair[..hd]);
-            gate[i * hd..(i + 1) * hd].copy_from_slice(&pair[hd..]);
-        }
+        let (mut q, gate) = if c.attn_gate {
+            let mut q = vec![0.0f32; n * c.n_head * hd];
+            let mut gate = vec![0.0f32; n * c.n_head * hd];
+            for (i, pair) in qg.chunks_exact(2 * hd).enumerate() {
+                q[i * hd..(i + 1) * hd].copy_from_slice(&pair[..hd]);
+                gate[i * hd..(i + 1) * hd].copy_from_slice(&pair[hd..]);
+            }
+            (q, Some(gate))
+        } else {
+            (qg, None)
+        };
 
         ops::rms_norm(&mut q, &a.q_norm, c.eps);
         ops::rms_norm(&mut k, &a.k_norm, c.eps);
-        for t in 0..n {
-            let pos = n_past + t;
-            ops::rope_neox(
-                &mut q[t * c.n_head * hd..(t + 1) * c.n_head * hd],
-                hd,
-                pos,
-                &self.inv_freq,
-            );
-            ops::rope_neox(
-                &mut k[t * kv_dim..(t + 1) * kv_dim],
-                hd,
-                pos,
-                &self.inv_freq,
-            );
+        if a.rope {
+            for t in 0..n {
+                let pos = n_past + t;
+                ops::rope_neox(
+                    &mut q[t * c.n_head * hd..(t + 1) * c.n_head * hd],
+                    hd,
+                    pos,
+                    &self.inv_freq,
+                );
+                ops::rope_neox(
+                    &mut k[t * kv_dim..(t + 1) * kv_dim],
+                    hd,
+                    pos,
+                    &self.inv_freq,
+                );
+            }
         }
-        // within the capacity reserved for the context
-        debug_assert!(k_cache.len() + k.len() <= k_cache.capacity());
-        k_cache.extend_from_slice(&k);
-        v_cache.extend_from_slice(&v);
+
+        // the rows of positions before the pass, and of the pass's: `k`, `v`
+        let (k_hist, v_hist, ring) = match &cache {
+            Cache::Full { k, v } => (&k[..], &v[..], None),
+            Cache::Ring { k, v, ring } => (&k[..], &v[..], Some(*ring)),
+        };
+        let hist_row = |p: usize| ring.map_or(p, |r| p % r) * kv_dim;
+        let k_at = |p: usize| -> &[f32] {
+            if p >= n_past {
+                &k[(p - n_past) * kv_dim..]
+            } else {
+                &k_hist[hist_row(p)..]
+            }
+        };
+        let v_at = |p: usize| -> &[f32] {
+            if p >= n_past {
+                &v[(p - n_past) * kv_dim..]
+            } else {
+                &v_hist[hist_row(p)..]
+            }
+        };
 
         let scale = 1.0 / (hd as f32).sqrt();
         let group = c.n_head / c.n_head_kv;
         let mut out = vec![0.0f32; n * c.n_head * hd];
-        let (k_cache, v_cache) = (&*k_cache, &*v_cache);
         out.par_chunks_mut(hd).enumerate().for_each(|(i, o)| {
             let (t, head) = (i / c.n_head, i % c.n_head);
             let kvh = head / group;
             let n_ctx = n_past + t + 1; // causal
+            let lo = a.window.map_or(0, |w| n_ctx.saturating_sub(w));
             let qh = &q[i * hd..(i + 1) * hd];
-            let mut scores: Vec<f32> = (0..n_ctx)
-                .map(|p| quant::dot_f32(qh, &k_cache[p * kv_dim + kvh * hd..][..hd]) * scale)
+            let mut scores: Vec<f32> = (lo..n_ctx)
+                .map(|p| quant::dot_f32(qh, &k_at(p)[kvh * hd..][..hd]) * scale)
                 .collect();
-            ops::softmax(&mut scores);
-            o.fill(0.0);
-            for (p, &w) in scores.iter().enumerate() {
-                quant::axpy(o, w, &v_cache[p * kv_dim + kvh * hd..][..hd]);
+            match &a.sinks {
+                Some(s) => ops::softmax_with_sink(&mut scores, s[head]),
+                None => ops::softmax(&mut scores),
             }
-            for (o, g) in o.iter_mut().zip(&gate[i * hd..(i + 1) * hd]) {
-                *o *= ops::sigmoid(*g);
+            o.fill(0.0);
+            for (p, &w) in (lo..n_ctx).zip(&scores) {
+                quant::axpy(o, w, &v_at(p)[kvh * hd..][..hd]);
+            }
+            if let Some(gate) = &gate {
+                for (o, g) in o.iter_mut().zip(&gate[i * hd..(i + 1) * hd]) {
+                    *o *= ops::sigmoid(*g);
+                }
             }
         });
+
+        // the pass's rows into the cache: appended, or the last `ring` into the ring
+        match cache {
+            Cache::Full { k: kc, v: vc } => {
+                // within the capacity reserved for the context
+                debug_assert!(kc.len() + k.len() <= kc.capacity());
+                kc.extend_from_slice(&k);
+                vc.extend_from_slice(&v);
+            }
+            Cache::Ring { k: kc, v: vc, ring } => {
+                for t in n.saturating_sub(ring)..n {
+                    let at = ((n_past + t) % ring) * kv_dim;
+                    kc[at..at + kv_dim].copy_from_slice(&k[t * kv_dim..(t + 1) * kv_dim]);
+                    vc[at..at + kv_dim].copy_from_slice(&v[t * kv_dim..(t + 1) * kv_dim]);
+                }
+            }
+        }
 
         matmul_new(&a.wo, &Input::new(&out, n))
     }
@@ -1130,11 +1379,33 @@ enum LayerState {
         k: Vec<f32>,
         v: Vec<f32>,
     },
+    /// a sliding window layer's caches: position `p` in row `p % ring`, the
+    /// last `ring` positions held, see [`Config::cpu_ring`]
+    Window {
+        k: Vec<f32>,
+        v: Vec<f32>,
+        ring: usize,
+    },
     /// `saved`: the states after each token but the last of a verify pass
     DeltaNet {
         conv: Vec<f32>,
         s: Vec<f32>,
         saved: Vec<(Vec<f32>, Vec<f32>)>,
+    },
+}
+
+/// The caches an attention layer reads and writes in a pass
+enum Cache<'c> {
+    /// a row per position, those of the pass appended
+    Full {
+        k: &'c mut Vec<f32>,
+        v: &'c mut Vec<f32>,
+    },
+    /// see [`LayerState::Window`]
+    Ring {
+        k: &'c mut [f32],
+        v: &'c mut [f32],
+        ring: usize,
     },
 }
 
@@ -1270,8 +1541,12 @@ pub struct State {
     pub n_past: usize,
     /// tokens the state can hold
     pub context: usize,
+    /// tokens a verify pass takes after the chosen one, at most
+    draft: usize,
     /// floats per position in the kv caches
     kv_dim: usize,
+    /// positions of a sliding window
+    window: usize,
     mtp: Option<MtpState>,
     verify: Option<Verify>,
 }
@@ -1287,6 +1562,8 @@ impl State {
                     m.kv += 4 * (k.capacity() + v.capacity());
                     m.kv_per_token += 2 * 4 * self.kv_dim;
                 }
+                // a fixed size, as a recurrent state
+                LayerState::Window { k, v, .. } => m.recurrent += 4 * (k.len() + v.len()),
                 LayerState::DeltaNet { conv, s, .. } => m.recurrent += 4 * (conv.len() + s.len()),
             }
         }
@@ -1300,15 +1577,14 @@ impl State {
     /// A copy of the state: the kv caches of the `n_past` tokens, the delta net states
     pub fn snapshot(&self) -> Result<StateSnapshot, Error> {
         assert!(self.verify.is_none(), "snapshot between verify and keep");
-        let kv = self.n_past * self.kv_dim;
         let layers = self
             .layers
             .iter()
-            .map(|ls| ls.snapshot(kv))
+            .map(|ls| ls.snapshot(self.n_past, self.kv_dim, self.window))
             .collect::<Result<_, _>>()?;
         let mtp = match &self.mtp {
             Some(m) => Some(MtpSnapshot {
-                kv: m.kv.snapshot(m.rows * self.kv_dim)?,
+                kv: m.kv.snapshot(m.rows, self.kv_dim, self.window)?,
                 rows: m.rows,
                 last: copied(&m.last)?,
             }),
@@ -1327,16 +1603,16 @@ impl State {
         if snap.n_past > self.context {
             return Err(Error::Snapshot("more tokens than the context holds"));
         }
-        let kv = snap.n_past * self.kv_dim;
+        let (n_past, kv_dim, window) = (snap.n_past, self.kv_dim, self.window);
         let fits = self.layers.len() == snap.layers.len()
             && self
                 .layers
                 .iter()
                 .zip(&snap.layers)
-                .all(|(ls, s)| ls.fits(s, kv))
+                .all(|(ls, s)| ls.fits(s, n_past, kv_dim, window))
             && match (&self.mtp, &snap.mtp) {
                 (Some(m), Some(s)) => {
-                    m.kv.fits(&s.kv, s.rows * self.kv_dim) && m.last.len() == s.last.len()
+                    m.kv.fits(&s.kv, s.rows, kv_dim, window) && m.last.len() == s.last.len()
                 }
                 (Some(_), None) => {
                     return Err(Error::Snapshot("no MTP history, for a drafting session"));
@@ -1347,10 +1623,10 @@ impl State {
             return Err(Error::Snapshot("taken from another model"));
         }
         for (ls, s) in self.layers.iter_mut().zip(&snap.layers) {
-            ls.restore(s);
+            ls.restore(s, n_past, kv_dim);
         }
         if let (Some(m), Some(s)) = (&mut self.mtp, &snap.mtp) {
-            m.kv.restore(&s.kv);
+            m.kv.restore(&s.kv, s.rows, kv_dim);
             m.rows = s.rows;
             m.last.copy_from_slice(&s.last);
         }
@@ -1378,14 +1654,27 @@ impl StateSnapshot {
 }
 
 enum LayerSnapshot {
-    Attention { k: Vec<f32>, v: Vec<f32> },
-    DeltaNet { conv: Vec<f32>, s: Vec<f32> },
+    Attention {
+        k: Vec<f32>,
+        v: Vec<f32>,
+    },
+    /// the rows of the positions a next token would see, in order
+    Window {
+        k: Vec<f32>,
+        v: Vec<f32>,
+    },
+    DeltaNet {
+        conv: Vec<f32>,
+        s: Vec<f32>,
+    },
 }
 
 impl LayerSnapshot {
     fn bytes(&self) -> usize {
         match self {
-            LayerSnapshot::Attention { k, v } => 4 * (k.len() + v.len()),
+            LayerSnapshot::Attention { k, v } | LayerSnapshot::Window { k, v } => {
+                4 * (k.len() + v.len())
+            }
             LayerSnapshot::DeltaNet { conv, s } => 4 * (conv.len() + s.len()),
         }
     }
@@ -1403,15 +1692,42 @@ fn copied(v: &[f32]) -> Result<Vec<f32>, Error> {
     Ok(c)
 }
 
+/// Positions of a sliding window a next token sees before its own, of the
+/// `n_past` held
+fn window_rows(n_past: usize, window: usize) -> usize {
+    n_past.min(window.saturating_sub(1))
+}
+
 impl LayerState {
-    /// The state, with the first `kv` floats of the caches: they may hold more,
-    /// left over from rejected tokens
-    fn snapshot(&self, kv: usize) -> Result<LayerSnapshot, Error> {
+    /// The state after `n_past` tokens of `kv_dim` floats a row: the caches'
+    /// first rows (they may hold more, left over from rejected tokens), or
+    /// the rows a sliding window still sees
+    fn snapshot(
+        &self,
+        n_past: usize,
+        kv_dim: usize,
+        window: usize,
+    ) -> Result<LayerSnapshot, Error> {
+        let kv = n_past * kv_dim;
         Ok(match self {
             LayerState::Attention { k, v } => LayerSnapshot::Attention {
                 k: copied(&k[..kv])?,
                 v: copied(&v[..kv])?,
             },
+            LayerState::Window { k, v, ring } => {
+                let first = n_past - window_rows(n_past, window);
+                let rows = |c: &[f32]| -> Result<Vec<f32>, Error> {
+                    let mut out = reserved((n_past - first) * kv_dim)?;
+                    for p in first..n_past {
+                        out.extend_from_slice(&c[(p % ring) * kv_dim..][..kv_dim]);
+                    }
+                    Ok(out)
+                };
+                LayerSnapshot::Window {
+                    k: rows(k)?,
+                    v: rows(v)?,
+                }
+            }
             LayerState::DeltaNet { conv, s, .. } => LayerSnapshot::DeltaNet {
                 conv: copied(conv)?,
                 s: copied(s)?,
@@ -1419,11 +1735,16 @@ impl LayerState {
         })
     }
 
-    /// Whether `snap` is a state of this layer, with `kv` floats in the caches
-    fn fits(&self, snap: &LayerSnapshot, kv: usize) -> bool {
+    /// Whether `snap` is a state of this layer after `n_past` tokens
+    fn fits(&self, snap: &LayerSnapshot, n_past: usize, kv_dim: usize, window: usize) -> bool {
         match (self, snap) {
             (LayerState::Attention { k, .. }, LayerSnapshot::Attention { k: sk, .. }) => {
+                let kv = n_past * kv_dim;
                 sk.len() == kv && kv <= k.capacity()
+            }
+            (LayerState::Window { ring, .. }, LayerSnapshot::Window { k: sk, .. }) => {
+                let rows = window_rows(n_past, window);
+                sk.len() == rows * kv_dim && rows <= *ring
             }
             (LayerState::DeltaNet { conv, s, .. }, LayerSnapshot::DeltaNet { conv: sc, s: ss }) => {
                 conv.len() == sc.len() && s.len() == ss.len()
@@ -1433,13 +1754,21 @@ impl LayerState {
     }
 
     /// Copy `snap`, which [`LayerState::fits`]; within capacity, the caches don't reallocate
-    fn restore(&mut self, snap: &LayerSnapshot) {
+    fn restore(&mut self, snap: &LayerSnapshot, n_past: usize, kv_dim: usize) {
         match (self, snap) {
             (LayerState::Attention { k, v }, LayerSnapshot::Attention { k: sk, v: sv }) => {
                 k.clear();
                 k.extend_from_slice(sk);
                 v.clear();
                 v.extend_from_slice(sv);
+            }
+            (LayerState::Window { k, v, ring }, LayerSnapshot::Window { k: sk, v: sv }) => {
+                let first = n_past - sk.len() / kv_dim;
+                for (i, p) in (first..n_past).enumerate() {
+                    let at = (p % *ring) * kv_dim;
+                    k[at..at + kv_dim].copy_from_slice(&sk[i * kv_dim..(i + 1) * kv_dim]);
+                    v[at..at + kv_dim].copy_from_slice(&sv[i * kv_dim..(i + 1) * kv_dim]);
+                }
             }
             (
                 LayerState::DeltaNet { conv, s, saved },
@@ -1458,18 +1787,65 @@ impl LayerState {
 mod tests {
     use super::*;
 
+    fn moe(k: usize, gating: Gating, norm_weights: bool) -> MoeConfig {
+        MoeConfig {
+            n_expert: 4,
+            n_expert_used: k,
+            n_ff_exp: 1,
+            n_ff_shexp: 0,
+            gating,
+            norm_weights,
+            weights_scale: 1.0,
+            shared_gate: false,
+        }
+    }
+
     #[test]
     fn route_picks_and_weighs() {
         // probabilities 0.5, 0.25, 0.125, 0.125 (equal logits for experts 2, 3)
         let l = [2f32.ln() + 1.0, 1.0, 0.5f32.ln() + 1.0, 0.5f32.ln() + 1.0].map(|x| x - 1.0);
-        let (ids, w) = route(&l, 3);
+        let (ids, w) = route(&l, &moe(3, Gating::Softmax, true), None);
         // the lower expert first among equals
         assert_eq!(ids, [0, 1, 2]);
         let sum = 0.5 + 0.25 + 0.125;
         for (w, p) in w.iter().zip([0.5, 0.25, 0.125]) {
             assert!((w - p / sum).abs() < 1e-6, "{w} {}", p / sum);
         }
-        let (ids, w) = route(&l, 1);
+        let (ids, w) = route(&l, &moe(1, Gating::Softmax, true), None);
         assert_eq!((ids, w), (vec![0], vec![1.0]));
+    }
+
+    #[test]
+    fn route_by_sigmoid_with_bias() {
+        // sigmoid probabilities 0.5, 0.75, 0.25, 0.9
+        let l = [0.0, 3f32.ln(), (1.0f32 / 3.0).ln(), 9f32.ln()];
+        let p = [0.5, 0.75, 0.25, 0.9];
+        let (ids, w) = route(&l, &moe(2, Gating::Sigmoid, false), None);
+        assert_eq!(ids, [3, 1]);
+        for (w, e) in w.iter().zip([0.9, 0.75]) {
+            assert!((w - e).abs() < 1e-6, "{w} {e}");
+        }
+        // the bias changes the choice, not the weights
+        let bias = [0.0, 0.0, 1.0, 0.0];
+        let (ids, w) = route(&l, &moe(2, Gating::Sigmoid, true), Some(&bias));
+        assert_eq!(ids, [2, 3]);
+        for (w, i) in w.iter().zip([2, 3]) {
+            let e = p[i] / (p[2] + p[3]);
+            assert!((w - e).abs() < 1e-6, "{w} {e}");
+        }
+    }
+
+    #[test]
+    fn sink_takes_probability() {
+        // a sink of the scores' logit: as a third score, dropped
+        let mut x = [1.0f32, 1.0];
+        ops::softmax_with_sink(&mut x, 1.0);
+        assert!(x.iter().all(|&p| (p - 1.0 / 3.0).abs() < 1e-6), "{x:?}");
+        // a very low sink takes nothing
+        let mut y = [0.5f32, -0.25];
+        let mut z = y;
+        ops::softmax_with_sink(&mut y, -1e30);
+        ops::softmax(&mut z);
+        assert_eq!(y, z);
     }
 }

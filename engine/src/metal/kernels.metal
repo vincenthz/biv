@@ -1054,10 +1054,21 @@ struct AttnArgs {
     int   splits; // attention: position ranges per (token, head)
     int   chunk;  // attention: positions per range
     int   n;      // tokens in the batch
+    int   gated;  // q is followed by its output gate, per head
+    int   window; // positions a token sees, its own included; 0: all
+    int   lo;     // first position of the ranges
+    int   mask;   // cache row of position p: p & mask (a ring of mask + 1 rows, or -1)
+    int   sinks;  // a sink logit per head adds to the softmax denominators
 };
 
+// first position token position `pos` sees
+inline int attn_first(constant AttnArgs & a, int pos) {
+    return a.window > 0 ? max(pos + 1 - a.window, 0) : 0;
+}
+
 // Per (head, token), 32 threads: q / k rms norm, NeoX rope on the first n_rot
-// dims, then q to q_out and k, v to the f16 cache at the token's position.
+// dims (none for 0), then q to q_out and k, v to the f16 cache at the token's
+// position.
 // Heads [0, n_head) are queries, [n_head, n_head + n_kv) are keys.
 // Lane l holds dims l + 32*j, so rope pairs (i, i + n_rot/2) stay in a lane
 // when n_rot/2 is a multiple of 32.
@@ -1085,7 +1096,7 @@ kernel void attn_prep(
     const bool is_q = head < a.n_head;
     const int kh = head - a.n_head;
 
-    device const float * src = is_q ? qg + (t*a.n_head + head)*2*hd : k + t*kv_dim + kh*hd;
+    device const float * src = is_q ? qg + (t*a.n_head + head)*(a.gated ? 2 : 1)*hd : k + t*kv_dim + kh*hd;
     device const float * w   = is_q ? q_norm : k_norm;
 
     float vals[MAXE];
@@ -1118,8 +1129,8 @@ kernel void attn_prep(
             dst[lane + 32*j] = vals[j];
         }
     } else {
-        device half * kd = k_cache + pos*kv_dim + kh*hd;
-        device half * vd = v_cache + pos*kv_dim + kh*hd;
+        device half * kd = k_cache + (pos & a.mask)*kv_dim + kh*hd;
+        device half * vd = v_cache + (pos & a.mask)*kv_dim + kh*hd;
         device const float * vs = v + t*kv_dim + kh*hd;
         for (int j = 0; j < E; j++) {
             kd[lane + 32*j] = (half) vals[j];
@@ -1160,7 +1171,8 @@ kernel void attn_split(
     const int t     = tg.z;
     const int kv_dim = a.n_kv*HD;
     const int n_ctx = a.pos0 + t + 1;
-    const int p0 = split*a.chunk;
+    const int first = attn_first(a, n_ctx - 1);
+    const int p0 = a.lo + split*a.chunk;
     const int p1 = min(p0 + a.chunk, n_ctx);
 
     float qv[HPS][E];
@@ -1181,9 +1193,11 @@ kernel void attn_split(
         l[h] = 0.f;
     }
 
-    for (int p = p0 + ps; p < p1; p += PS) {
-        device const half4 * kp = (device const half4 *) (k_cache + p*kv_dim + kvh*HD + lane*E);
-        device const half4 * vp = (device const half4 *) (v_cache + p*kv_dim + kvh*HD + lane*E);
+    // this simdgroup's positions, from the first the token sees
+    const int start = p0 + ps + (max(first - p0 - ps, 0) + PS - 1)/PS*PS;
+    for (int p = start; p < p1; p += PS) {
+        device const half4 * kp = (device const half4 *) (k_cache + (p & a.mask)*kv_dim + kvh*HD + lane*E);
+        device const half4 * vp = (device const half4 *) (v_cache + (p & a.mask)*kv_dim + kvh*HD + lane*E);
         float kf[E];
         float vf[E];
         for (int j = 0; j < E/4; j++) {
@@ -1273,13 +1287,14 @@ ATTN_SPLIT(256, 1, 1, 2) ATTN_SPLIT(256, 2, 2, 2) ATTN_SPLIT(256, 4, 2, 2) ATTN_
 
 // Merge the `splits` partials of one (head, token), one thread per dim, and
 // gate the result by sigmoid(gate), the second half of each head of the
-// joint q projection.
+// joint q projection, when gated.
 kernel void attn_reduce(
         constant AttnArgs & a [[buffer(0)]],
         device const float * part_o  [[buffer(1)]],
         device const float * part_ml [[buffer(2)]],
         device const float * qg      [[buffer(3)]],
         device       float * out     [[buffer(4)]],
+        device const float * sinks   [[buffer(5)]],
         uint2  tg  [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]]) {
     const int head = tg.x;
@@ -1287,7 +1302,8 @@ kernel void attn_reduce(
     const int hd   = a.hd;
     const int part = (t*a.n_head + head)*a.splits;
 
-    // split 0 always holds position 0, so M is finite
+    // the last split holds the token's position, so M is finite; with a
+    // window, the first ones may hold none (M -inf, L 0)
     float M = -INFINITY;
     for (int s = 0; s < a.splits; s++) {
         M = max(M, part_ml[2*(part + s)]);
@@ -1299,8 +1315,15 @@ kernel void attn_reduce(
         L += w * part_ml[2*(part + s) + 1];
         o += w * part_o[(part + s)*hd + tid];
     }
-    const float gate = qg[(t*a.n_head + head)*2*hd + hd + tid];
-    out[(t*a.n_head + head)*hd + tid] = o / L * sigmoid(gate);
+    if (a.sinks) {
+        L += exp(sinks[head] - M);
+    }
+    if (a.gated) {
+        const float gate = qg[(t*a.n_head + head)*2*hd + hd + tid];
+        out[(t*a.n_head + head)*hd + tid] = o / L * sigmoid(gate);
+    } else {
+        out[(t*a.n_head + head)*hd + tid] = o / L;
+    }
 }
 
 // Causal attention over a batch of tokens ("flash attention"), for prefill.
@@ -1330,6 +1353,7 @@ kernel void attn_flash(
         device const half  * v_cache [[buffer(3)]],
         device       float * qg      [[buffer(4)]], // SPLIT: part_o
         device       float * out     [[buffer(5)]], // SPLIT: part_ml
+        device const float * sinks   [[buffer(6)]],
         threadgroup  half  * shm     [[threadgroup(0)]],
         uint3  tg   [[threadgroup_position_in_grid]],
         uint3  ntg  [[threadgroups_per_grid]],
@@ -1367,18 +1391,21 @@ kernel void attn_flash(
         ((threadgroup half4 *) sq)[i] = (half4) v;
     }
 
-    // softmax state of this simdgroup's rows, and the last position each sees;
-    // rows past the batch see what the last one does
+    // softmax state of this simdgroup's rows, and the first and last position
+    // each sees; rows past the batch see what the last one does
+    int   first[NQ];
     int   last[NQ];
     float M[NQ];
     float L[NQ];
     FOR_UNROLL (int j = 0; j < NQ; j++) {
         last[j] = a.pos0 + min(row0 + sg*NQ + j, rows - 1)/G;
+        first[j] = attn_first(a, last[j]);
         M[j] = -FLT_MAX/2;
         L[j] = 0.f;
     }
     const int last_end = a.pos0 + (min(row0 + R, rows) - 1)/G + 1;
-    const int begin = SPLIT ? (int) tg.z*a.chunk : 0;
+    // from the tile of the first position the block's first row sees
+    const int begin = SPLIT ? a.lo + (int) tg.z*a.chunk : attn_first(a, a.pos0 + row0/G) / C * C;
     const int end   = SPLIT ? min(begin + a.chunk, last_end) : last_end;
 
     // this simdgroup's score tiles
@@ -1404,7 +1431,9 @@ kernel void attn_flash(
                     ms[i][j] = make_filled_simdgroup_matrix<float, 8>(0.f);
                 }
             }
-            device const half * pk = k_cache + (p0 + 8*qc0)*kv_dim + kvh*HD;
+            // a tile's positions are rows in a row of the cache: the ring
+            // holds a multiple of C
+            device const half * pk = k_cache + ((p0 & a.mask) + 8*qc0)*kv_dim + kvh*HD;
             _Pragma("clang loop unroll_count(4)") for (int d = 0; d < DT; d++) {
                 simdgroup_half8x8 mq[QR];
                 FOR_UNROLL (int i = 0; i < QR; i++) {
@@ -1432,7 +1461,7 @@ kernel void attn_flash(
             float m = M[j];
             FOR_UNROLL (int c = 0; c < CL; c++) {
                 const int i = lane + 32*c;
-                s[c] = p0 + i <= last[j] && p0 + i < end ? ss[r*C + i] : -INFINITY;
+                s[c] = p0 + i <= last[j] && p0 + i >= first[j] && p0 + i < end ? ss[r*C + i] : -INFINITY;
                 m = max(m, s[c]);
             }
             m = simd_max(m);
@@ -1459,7 +1488,7 @@ kernel void attn_flash(
                 e[1] *= f;
             }
         }
-        device const half * pv = v_cache + p0*kv_dim + kvh*HD + 8*sg*OD;
+        device const half * pv = v_cache + (p0 & a.mask)*kv_dim + kvh*HD + 8*sg*OD;
         FOR_UNROLL (int ct = 0; ct < CT; ct++) {
             simdgroup_half8x8 mv[OD];
             FOR_UNROLL (int k = 0; k < OD; k++) {
@@ -1507,7 +1536,12 @@ kernel void attn_flash(
     }
     if (lane == 0) {
         FOR_UNROLL (int j = 0; j < NQ; j++) {
-            sf[sg*NQ + j] = 1.f/L[j];
+            float l = L[j];
+            if (a.sinks) {
+                const int g = min(row0 + sg*NQ + j, rows - 1);
+                l += exp(sinks[kvh*G + g%G] - M[j]);
+            }
+            sf[sg*NQ + j] = 1.f/l;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1524,8 +1558,13 @@ kernel void attn_flash(
         FOR_UNROLL (int k = 0; k < OD; k++) {
             thread auto & e = mo[rt][k].thread_elements();
             const int i = 8*(sg*OD + k) + lc;
-            o[i]     = e[0] * inv * sigmoid(gate[i]);
-            o[i + 1] = e[1] * inv * sigmoid(gate[i + 1]);
+            if (a.gated) {
+                o[i]     = e[0] * inv * sigmoid(gate[i]);
+                o[i + 1] = e[1] * inv * sigmoid(gate[i + 1]);
+            } else {
+                o[i]     = e[0] * inv;
+                o[i + 1] = e[1] * inv;
+            }
         }
     }
 }
@@ -1535,7 +1574,7 @@ kernel void attn_flash(
 #define ATTN_FLASH(name, hd, split) \
 template [[host_name(name)]] kernel void attn_flash<hd, 16, 64, 4, 2, split>( \
     constant AttnArgs &, device const float *, device const half *, device const half *, \
-    device float *, device float *, threadgroup half *, uint3, uint3, ushort, ushort, ushort);
+    device float *, device float *, device const float *, threadgroup half *, uint3, uint3, ushort, ushort, ushort);
 ATTN_FLASH("attn_flash_128", 128, false) ATTN_FLASH("attn_flash_256", 256, false)
 ATTN_FLASH("attn_flash_split_128", 128, true) ATTN_FLASH("attn_flash_split_256", 256, true)
 
@@ -1664,7 +1703,14 @@ template [[host_name("gdn_128")]] kernel void gdn<4>(constant GdnArgs &, device 
 // multiply each tile by its expert's matrix (the weights read once per tile),
 // and `moe_combine` sums the pairs of each token.
 
-struct RouteArgs { int n_expert; int k; };
+struct RouteArgs {
+    int   n_expert;
+    int   k;
+    int   sigmoid; // gating: sigmoid of each logit, else softmax of the logits
+    int   bias;    // a bias per expert adds to the probabilities to choose them
+    int   norm;    // the weights over their sum
+    float scale;   // of the weights
+};
 
 // the larger of two (probability, expert), the lower expert among equals
 inline void best_of(thread float & v, thread int & i, float v2, int i2) {
@@ -1674,14 +1720,16 @@ inline void best_of(thread float & v, thread int & i, float v2, int i2) {
     }
 }
 
-// One threadgroup per token: the softmax of its router logits, its k experts
-// of highest probability, and their probabilities over their sum. `p` holds
-// the probabilities, a chosen expert's set to -1.
+// One threadgroup per token: the softmax (or sigmoids) of its router logits,
+// its k experts of highest probability (plus bias), and their probabilities
+// over their sum (or as they are), scaled. `p` holds the probabilities plus
+// bias, a chosen expert's set to -inf.
 kernel void moe_route(
         constant RouteArgs & args [[buffer(0)]],
         device const float * logits [[buffer(1)]],
         device int   * ids     [[buffer(2)]],
         device float * weights [[buffer(3)]],
+        device const float * bias  [[buffer(4)]],
         threadgroup float * p [[threadgroup(0)]],
         uint   tg   [[threadgroup_position_in_grid]],
         ushort tid  [[thread_position_in_threadgroup]],
@@ -1693,6 +1741,47 @@ kernel void moe_route(
     const int ne = args.n_expert;
     const short nsg = (ntg + 31)/32;
     device const float * l = logits + tg*ne;
+
+    if (args.sigmoid) {
+        for (int i = tid; i < ne; i += ntg) {
+            p[i] = sigmoid(l[i]) + (args.bias ? bias[i] : 0.f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total = 0.f;
+        for (int j = 0; j < args.k; j++) {
+            float v = -INFINITY;
+            int   bi = ne;
+            for (int i = tid; i < ne; i += ntg) {
+                best_of(v, bi, p[i], i);
+            }
+            for (ushort o = 16; o > 0; o /= 2) {
+                best_of(v, bi, simd_shuffle_down(v, o), simd_shuffle_down(bi, o));
+            }
+            if (lane == 0) {
+                red_v[sg] = v;
+                red_i[sg] = bi;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            v = red_v[0];
+            bi = red_i[0];
+            for (short s = 1; s < nsg; s++) best_of(v, bi, red_v[s], red_i[s]);
+            const float w = sigmoid(l[bi]);
+            total += w;
+            if (tid == 0) {
+                ids[tg*args.k + j] = bi;
+                weights[tg*args.k + j] = w;
+                p[bi] = -INFINITY;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+        }
+        if (tid == 0) {
+            const float s = (args.norm ? 1.f/max(total, 6.103515625e-5f) : 1.f) * args.scale;
+            for (int j = 0; j < args.k; j++) {
+                weights[tg*args.k + j] *= s;
+            }
+        }
+        return;
+    }
 
     float m = -INFINITY;
     for (int i = tid; i < ne; i += ntg) {
@@ -1749,9 +1838,12 @@ kernel void moe_route(
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
     if (tid == 0) {
-        const float s = 1.f/max(total, 6.103515625e-5f);
+        const float s = args.norm ? 1.f/max(total, 6.103515625e-5f) : 1.f;
         for (int j = 0; j < args.k; j++) {
             weights[tg*args.k + j] *= s;
+            if (args.scale != 1.f) {
+                weights[tg*args.k + j] *= args.scale;
+            }
         }
     }
 }
@@ -1996,7 +2088,8 @@ template [[host_name("mm_id_q6_K")]] kernel mm_id_t mm_id<block_q6_K, QK_NL, deq
 
 struct CombineArgs { int n_embd; int k; int shared; };
 
-// x[t] += sum_j weights[t*k + j] * out[t*k + j] + sigmoid(gate[t]) * shared[t]
+// x[t] += sum_j weights[t*k + j] * out[t*k + j] + sigmoid(gate[t]) * shared[t];
+// shared: 0 none, 1 gated, 2 ungated (+ shared[t])
 kernel void moe_combine(
         constant CombineArgs & args [[buffer(0)]],
         device float       * x       [[buffer(1)]],
@@ -2013,8 +2106,10 @@ kernel void moe_combine(
     for (int j = 0; j < args.k; j++) {
         acc += weights[t*args.k + j]*out[(t*args.k + j)*args.n_embd + d];
     }
-    if (args.shared) {
+    if (args.shared == 1) {
         acc += sigmoid(gate[t])*shared[t*args.n_embd + d];
+    } else if (args.shared == 2) {
+        acc += shared[t*args.n_embd + d];
     }
     x[t*args.n_embd + d] += acc;
 }
