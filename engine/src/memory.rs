@@ -126,6 +126,9 @@ pub enum Backend {
     /// the `max_batch` of [`MetalEngine::new`](crate::metal::MetalEngine::new)
     #[cfg(all(feature = "metal", target_os = "macos"))]
     Metal { max_batch: usize },
+    /// the `max_batch` of [`CudaEngine::new`](crate::cuda::CudaEngine::new)
+    #[cfg(feature = "cuda")]
+    Cuda { max_batch: usize },
 }
 
 /// What session sizes depend on, besides the session parameters
@@ -265,6 +268,12 @@ impl Footprint {
                 params: 2 * self.model.params,
                 ..self.model
             },
+            // the small vectors are uploaded, the weights copied
+            #[cfg(feature = "cuda")]
+            Backend::Cuda { .. } => ModelMemory {
+                params: 2 * self.model.params,
+                ..self.model
+            },
         }
     }
 
@@ -276,6 +285,8 @@ impl Footprint {
             Backend::Cpu { batch } => self.shape().cpu_session(context, draft, batch),
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal { max_batch } => self.shape().metal_session(context, draft, max_batch),
+            #[cfg(feature = "cuda")]
+            Backend::Cuda { max_batch } => self.shape().cuda_session(context, draft, max_batch),
         }
     }
 

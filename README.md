@@ -24,6 +24,7 @@ Note: It might support other models that use those model architectures.
 Inference engines:
 
 * Metal (supported Apple Silicon)
+* CUDA (NVIDIA GPUs, `--features cuda`; use .dll/.so dynamic loading; not yet fully tuned)
 * CPU (some optimisation for aarch64 NEON, X86-64 AVX2 and AVX-VNNI)
 
 BIV is meant to be integrated into application easily, and has small
@@ -49,6 +50,51 @@ use AVX2 in the non-kernel code (norms, softmax, sampling).
 On macOS the Metal backend is the default. Its shaders are compiled from source
 at startup, which takes about 0.5s, and the weights are used in place from the
 mmap'd GGUF with no copy.
+
+### CUDA
+
+The CUDA backend is behind the `cuda` feature, off by default on every
+platform (a plain build needs no CUDA toolkit). With it, the CLI runs on the
+GPU unless `--cpu`:
+
+```sh
+cargo build --release --features cuda
+./target/release/biv -m /path/to/model.gguf
+```
+
+The build needs the CUDA toolkit (nvcc, ptxas; found through `NVCC`, `PATH`,
+`CUDA_HOME` or the usual install paths) and, on Windows, the MSVC compiler
+nvcc runs: build from a "x64 Native Tools" prompt, or after `vcvars64.bat`.
+[cudaforge](https://crates.io/crates/cudaforge) compiles `engine/src/cuda/kernels.cu`
+to PTX, and ptxas assembles it for the GPU that `nvidia-smi` reports, or the
+one `CUDA_COMPUTE_CAP` names (`CUDA_COMPUTE_CAP=89 cargo build ...`). Both are
+embedded: the engine loads the machine code on that GPU, which works with a
+driver older than the toolkit, and has the driver compile the PTX on other
+GPUs (which needs a driver as recent as the toolkit). The driver library
+(`nvcuda.dll`, `libcuda.so.1`) is loaded at run time, nothing CUDA is linked.
+
+The weights are copied to the GPU: the output head and the layers first, then
+the experts of a mixture of experts. The CLI leaves the device memory its
+session needs (`--ctx`, `--batch`); what doesn't fit in the rest goes to
+pinned host memory that the GPU reads across the bus, so models larger than
+the GPU run, at the speed of the bus for that part. The token embeddings stay
+on the host. KV caches are f16, as on Metal.
+
+Not yet on CUDA: drafting with the MTP head (`--draft` gives the room to
+verify, `--lookup` works), sequences batched in one pass (they run one after
+another), and tuned kernels: decode reads the weights at about half the
+memory bandwidth, prefill uses no tensor cores. On an RTX 5080 (16 GB, PCIe 5),
+with `examples/compare.rs` (2 GB left for the session):
+
+| model | weights on the GPU / host | prefill (~50 tokens) | decode |
+|---|---|---|---|
+| Qwen3.5-4B Q8_0 | 4.5 / 0 GB | 0.23 s | 105 tok/s |
+| Qwen3.8-27B Q4_1 | 13.0 / 3.5 GB | 1.8 s | 8.1 tok/s |
+| Qwen3.6-35B-A3B Q8_0 | 13.0 / 23.4 GB | 0.9 s | 21 tok/s |
+| Flint Q8_0 | 12.9 / 29.1 GB | 1.0 s | 24 tok/s |
+
+The CLI leaves only what its session takes: with a 16k context, 13.7 GB of the
+27B go to the GPU, and it decodes at 10.5 tok/s.
 
 Models are looked up in the Hugging Face cache (`$HF_HUB_CACHE`, `$HF_HOME/hub`,
 `~/.cache/huggingface/hub`). That's where skelm downloads them, and it uses the
@@ -221,6 +267,7 @@ time either way (cpuid). Its features:
 | `std` (default) | std's float functions |
 | `rayon` (default) | multithreaded CPU compute |
 | `metal` | the Metal backend (macOS) |
+| `cuda` | the CUDA backend (NVIDIA): needs the CUDA toolkit to build |
 
 | file | role |
 |---|---|
@@ -235,6 +282,10 @@ time either way (cpuid). Its features:
 | `engine/src/batch.rs` | continuous batching: the scheduler, and the `Engine` handle whose sessions it serves |
 | `engine/src/metal/mod.rs` | Metal backend: no-copy weight buffers, per-sequence KV/recurrent state, one command buffer per forward pass of one or more sequences, on a concurrent encoder |
 | `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels, expert routing and sorting, the matmul / matvec over each expert's tokens, and the matvec per (token, expert) pair of decode steps |
+| `engine/src/cuda/mod.rs` | CUDA backend: weight placement (device, then mapped host memory), per-sequence KV/recurrent state, the kernel launches of a forward pass |
+| `engine/src/cuda/kernels.cu` | matvec / matmul per quant type (32-value units dequantized per lane), the same over each expert's pairs, norm, rope + cache write, attention (online softmax, sinks, rings), conv and gated delta-net, expert routing, sorting and combining |
+| `engine/src/cuda/driver.rs` | the CUDA driver API, loaded at run time; device and mapped host buffers |
+| `engine/build.rs` | with `cuda`: the kernels compiled by cudaforge / nvcc to PTX, assembled by ptxas |
 | `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35` and `flint` pre-tokenizer regexes, matched by hand |
 | `engine/src/chat.rs` | chat templates (ChatML with `<think>`, Flint's role tokens), incremental multi-turn state, the speculative decoding loop |
 | `engine/src/transcript.rs` | a conversation as token ids, and its bytes |
@@ -398,10 +449,14 @@ chats, `ChatOptions::draft` at 0 or 1 is faster.
   that copy from the prompt are the same text with and without lookup, with
   the engine's drafts and without, alone and in a batch; on a model without
   MTP head too, whose sessions keep the room to verify the proposals.
-- `examples/compare.rs <gguf> [repeat]`: Metal vs CPU logits on the same prompt,
-  then decode steps. The top-1 token matches at every step. Max logit differences
-  are 0.2–0.4 on short prompts and up to a few units in the tail at ~700 tokens
-  (f16 KV cache, half-precision matmul tiles).
+- `examples/compare.rs <gguf> [repeat] [context]`: GPU (Metal, or CUDA with the
+  `cuda` feature) vs CPU logits on the same prompt, then decode steps. The top-1
+  token matches at every step. Max logit differences are 0.2–0.4 on short prompts
+  and up to a few units in the tail at ~700 tokens (f16 KV cache, half-precision
+  matmul tiles). CUDA's differences are those of Metal on the dense models; on
+  the MoE models (where a near tie picks other experts) and Flint both GPUs
+  differ from the CPU by up to a few units, and from each other by less: the
+  CPU quantizes the activations to int8, the GPUs don't.
 - `examples/prefix.rs <gguf> [--cpu] [-n tokens]`: a chat restored from a saved
   system prompt or first turn gives the same greedy answer as the chat that
   saved it, on Metal and on the CPU, with or without drafts; so does a chat

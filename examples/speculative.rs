@@ -29,17 +29,14 @@ fn main() {
     let tok = Tokenizer::from_gguf(&g).unwrap();
     let model = Model::load(&g).unwrap();
     assert!(model.has_mtp(), "the model has no MTP head");
-    #[cfg(target_os = "macos")]
-    let metal = (!cpu).then(|| biv::metal::MetalEngine::new(&model, 256).unwrap());
-    #[cfg(target_os = "macos")]
-    let engine: &dyn Engine = match &metal {
-        Some(m) => m,
-        None => &model,
+    let gpu = if cpu {
+        None
+    } else {
+        biv_cli::gpu_engine(&model, 256).unwrap()
     };
-    #[cfg(not(target_os = "macos"))]
-    let engine: &dyn Engine = {
-        let _ = cpu;
-        &model
+    let engine: &dyn Engine = match &gpu {
+        Some(g) => g.as_ref(),
+        None => &model,
     };
     println!("{}", engine.description());
 

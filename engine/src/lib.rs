@@ -1,10 +1,10 @@
 //! Pure Rust inference for Qwen3.8 (llama.cpp `qwen35` and `qwen35moe` GGUF models) and
-//! Flint (`flint`), on CPU or Metal.
+//! Flint (`flint`), on CPU, Metal or CUDA.
 //!
 //! No I/O: a model is parsed from the bytes of its GGUF, however the caller
 //! got them (mmap, embedded, read into memory). The crate is `no_std` + `alloc`
 //! without its default features; `std` brings std's float functions, `rayon` the
-//! multithreaded CPU compute, `metal` the Metal backend.
+//! multithreaded CPU compute, `metal` the Metal backend, `cuda` the CUDA backend.
 
 #![no_std]
 
@@ -15,6 +15,8 @@ extern crate std;
 #[cfg(feature = "std")]
 pub mod batch;
 pub mod chat;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod engine;
 mod error;
 pub mod gguf;

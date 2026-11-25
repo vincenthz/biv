@@ -18,15 +18,15 @@ fn main() {
 
     let g = biv_cli::open_gguf(&path).unwrap();
     let model = Model::load(&g).unwrap();
-    #[cfg(target_os = "macos")]
-    let metal = (!cpu).then(|| biv::metal::MetalEngine::new(&model, bs).unwrap());
-    #[cfg(target_os = "macos")]
-    let engine: &dyn Engine = match &metal {
-        Some(m) => m,
+    let gpu = if cpu {
+        None
+    } else {
+        biv_cli::gpu_engine(&model, bs).unwrap()
+    };
+    let engine: &dyn Engine = match &gpu {
+        Some(g) => g.as_ref(),
         None => &model,
     };
-    #[cfg(not(target_os = "macos"))]
-    let engine: &dyn Engine = &model;
     println!("{}", engine.description());
     let sm = engine.session_memory(8192, 4);
     println!(

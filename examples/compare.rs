@@ -1,11 +1,12 @@
-//! Metal vs CPU logits on the same sequence: prefill (matmul kernels), then decode steps (matvec kernels)
-#[cfg(target_os = "macos")]
+//! GPU vs CPU logits on the same sequence: prefill (matmul kernels), then
+//! decode steps (matvec kernels). Metal on macOS, CUDA with the `cuda` feature.
+//!
+//! `compare <gguf> [repeat] [context]`: the prompt repeated `repeat` times
+#[cfg(any(target_os = "macos", feature = "cuda"))]
 mod imp {
     use std::time::Instant;
 
-    use biv::{
-        engine::Engine, metal::MetalEngine, model::Model, sampler::argmax, tokenizer::Tokenizer,
-    };
+    use biv::{engine::Engine, model::Model, sampler::argmax, tokenizer::Tokenizer};
 
     fn top(l: &[f32], k: usize) -> Vec<(usize, f32)> {
         let mut v: Vec<_> = l.iter().copied().enumerate().collect();
@@ -27,32 +28,31 @@ mod imp {
             if same { "identical" } else { "DIFFERENT" }
         );
         if !same {
-            println!("  cpu   {ta:?}\n  metal {tb:?}");
+            println!("  cpu {ta:?}\n  gpu {tb:?}");
         }
     }
 
     pub fn main() {
-        let path = std::env::args().nth(1).unwrap();
+        let mut args = std::env::args().skip(1);
+        let path = args.next().unwrap();
+        let repeat: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(1);
+        let context: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(8192);
         let g = biv_cli::open_gguf(&path).unwrap();
         let tok = Tokenizer::from_gguf(&g).unwrap();
         let model = Model::load(&g).unwrap();
         let t = Instant::now();
-        let metal = MetalEngine::new(&model, 256).unwrap();
+        let engine = biv_cli::gpu_engine(&model, 256).unwrap().unwrap();
         println!(
-            "metal engine ready in {:?}: {}",
+            "gpu engine ready in {:?}: {}",
             t.elapsed(),
-            metal.description()
+            engine.description()
         );
 
-        let repeat: usize = std::env::args()
-            .nth(2)
-            .map(|s| s.parse().unwrap())
-            .unwrap_or(1);
         let ids = tok.encode(&"Rust is a multi-paradigm, general-purpose programming language that emphasizes performance, type safety, and concurrency. It enforces memory safety, meaning that all references point to valid memory, without a garbage collector. Software developer Graydon Hoare created Rust. ".repeat(repeat));
         let ids = &ids[..ids.len() - 1]; // end mid-sentence: " Rust"
         let ids = ids.to_vec();
-        let mut cpu = (&model).new_session(8192, 0).unwrap();
-        let mut gpu = metal.new_session(8192, 0).unwrap();
+        let mut cpu = (&model).new_session(context, 0).unwrap();
+        let mut gpu = engine.new_session(context, 0).unwrap();
 
         let t = Instant::now();
         let lc = cpu.forward(&ids);
@@ -60,7 +60,7 @@ mod imp {
         let t = Instant::now();
         let lg = gpu.forward(&ids);
         let tg = t.elapsed();
-        println!("prefill {} tokens: cpu {tc:?}, metal {tg:?}", ids.len());
+        println!("prefill {} tokens: cpu {tc:?}, gpu {tg:?}", ids.len());
         report("prefill", &lc, &lg);
 
         // decode a few greedy tokens with both, feeding the cpu choice to both
@@ -75,7 +75,7 @@ mod imp {
         }
         println!("cpu text: {:?}", tok.decode(&text));
 
-        // metal decode speed
+        // gpu decode speed
         let n = 32;
         let t = Instant::now();
         for _ in 0..n {
@@ -83,15 +83,15 @@ mod imp {
             next = argmax(&l);
         }
         println!(
-            "metal decode: {:.1} tok/s",
+            "gpu decode: {:.1} tok/s",
             n as f64 / t.elapsed().as_secs_f64()
         );
     }
 }
 
 fn main() {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", feature = "cuda"))]
     imp::main();
-    #[cfg(not(target_os = "macos"))]
-    eprintln!("compare needs the Metal backend (macOS)");
+    #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+    eprintln!("compare needs a GPU backend: Metal (macOS) or the cuda feature");
 }

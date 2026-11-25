@@ -93,3 +93,24 @@ pub fn open_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer, Error> {
         source,
     })
 }
+
+/// The GPU engine of this build for passes of up to `max_batch` tokens:
+/// Metal on macOS, CUDA with the `cuda` feature; None without one
+pub fn gpu_engine<'m>(
+    model: &'m biv::model::Model<'m>,
+    max_batch: usize,
+) -> Result<Option<Box<dyn biv::engine::Engine + 'm>>, biv::Error> {
+    #[cfg(target_os = "macos")]
+    return Ok(Some(Box::new(biv::metal::MetalEngine::new(
+        model, max_batch,
+    )?)));
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    return Ok(Some(Box::new(biv::cuda::CudaEngine::new(
+        model, max_batch,
+    )?)));
+    #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+    {
+        let _ = (model, max_batch);
+        Ok(None)
+    }
+}

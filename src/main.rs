@@ -31,11 +31,13 @@ usage: biv [options]
                             (Qwen only)
   -c, --ctx <n>             context size in tokens [default: 16384]
   -n, --max-tokens <n>      tokens per answer, thinking included [default: 8192]
-      --cpu                 run on the CPU instead of the GPU (Metal)
+      --cpu                 run on the CPU instead of the GPU (Metal, or CUDA in
+                            a build with the cuda feature)
   -t, --threads <n>         CPU compute threads [default: all cores]
-  -b, --batch <n>           prompt tokens per forward pass [default: 64 cpu, 512 metal]
+  -b, --batch <n>           prompt tokens per forward pass [default: 64 cpu, 512 gpu]
   -d, --draft <n>           tokens drafted per step by the model's MTP head for
-                            speculative decoding, 0 to disable [default: 1 cpu, 4 metal]
+                            speculative decoding, 0 to disable [default: 1 cpu,
+                            4 metal, 0 cuda (no drafts yet)]
   -l, --lookup <n>          tokens proposed per step from earlier text of the
                             conversation when the answer repeats it (quotes,
                             code edits), 0 to disable [default: 0]
@@ -87,7 +89,7 @@ fn parse_args() -> Result<Args, String> {
         model: DEFAULT_MODEL.to_string(),
         prompt: None,
         threads: None,
-        cpu: !cfg!(target_os = "macos"),
+        cpu: !cfg!(any(target_os = "macos", feature = "cuda")),
         opts: ChatOptions::default(),
         temp: None,
         top_k: None,
@@ -251,23 +253,38 @@ fn print_memory(chat: &Chat<'_>, engine: &dyn Engine) {
 
 fn make_engine<'m>(
     model: &'m Model<'m>,
+    gguf: &Gguf,
     cpu: bool,
-    batch: Option<usize>,
+    opts: &ChatOptions,
 ) -> Result<Box<dyn Engine + 'm>, Box<dyn Error>> {
     if cpu {
         return Ok(Box::new(model));
     }
+    let batch = opts.batch.unwrap_or(512);
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(biv::metal::MetalEngine::new(
+        let _ = gguf;
+        Ok(Box::new(biv::metal::MetalEngine::new(model, batch)?))
+    }
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    {
+        // the device memory the chat's session takes stays free: the weights
+        // that don't fit in the rest go to host memory
+        use biv::memory::{Backend, Footprint};
+        let context = opts.context.min(model.cfg.context_length);
+        let draft = opts.draft.unwrap_or(0).max(opts.lookup);
+        let session =
+            Footprint::from_gguf(gguf)?.session(Backend::Cuda { max_batch: batch }, context, draft);
+        Ok(Box::new(biv::cuda::CudaEngine::with_reserve(
             model,
-            batch.unwrap_or(512),
+            batch,
+            session.allocated(),
         )?))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", feature = "cuda")))]
     {
-        let _ = batch;
-        Err("no GPU backend on this platform, use --cpu".into())
+        let _ = (gguf, batch);
+        Err("no GPU backend in this build: use --cpu, or build with --features cuda".into())
     }
 }
 
@@ -319,7 +336,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let gguf = biv_cli::open_gguf(&path)?;
     let tok = Tokenizer::from_gguf(&gguf)?;
     let model = Model::load(&gguf)?;
-    let engine = make_engine(&model, args.cpu, args.opts.batch)?;
+    let engine = make_engine(&model, &gguf, args.cpu, &args.opts)?;
     let name = gguf
         .metadata
         .general

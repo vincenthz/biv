@@ -12,6 +12,10 @@ license = "MIT OR Apache-2.0"
 name = "biv"
 path = "src/main.rs"
 
+[features]
+# the CUDA backend, see the engine's `cuda` feature
+cuda = ["biv/cuda"]
+
 [dependencies]
 biv = { path = "engine" }
 ctrlc = "3.5.2"
@@ -20,3 +24,6 @@ rayon = "1.12.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 biv = { path = "engine", features = ["metal"] }
+
+[patch.crates-io]
+cudaforge = { git = "https://github.com/vincenthz/cudaforge", branch = "remove-sha2" }
