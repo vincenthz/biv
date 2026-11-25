@@ -29,6 +29,8 @@ usage: biv [options]
       --no-think            disable the reasoning block (Flint decides by itself)
       --effort <level>      reasoning effort: low, medium, xhigh [default: xhigh]
                             (Qwen only)
+      --builtin-format      render prompts with biv's built-in formats, even
+                            when the model's chat template is a compiled one
   -c, --ctx <n>             context size in tokens [default: 16384]
   -n, --max-tokens <n>      tokens per answer, thinking included [default: 8192]
       --cpu                 run on the CPU instead of the GPU (Metal, or CUDA in
@@ -116,6 +118,7 @@ fn parse_args() -> Result<Args, String> {
             "-p" | "--prompt" => a.prompt = Some(val()?),
             "-s" | "--system" => a.opts.system = Some(val()?),
             "--no-think" => a.opts.thinking = false,
+            "--builtin-format" => a.opts.builtin_format = true,
             "--effort" => {
                 let v = val()?;
                 a.opts.effort = ReasoningEffort::parse(&v)
@@ -413,6 +416,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     let mut chat = Chat::new(engine.as_ref(), &tok, opts)?;
+    match chat.template() {
+        Some(t) => eprintln!("prompts: the compiled {} chat template", t.name()),
+        None if chat.opts.builtin_format => eprintln!("prompts: the built-in format"),
+        None => eprintln!(
+            "prompts: the built-in format, the model's chat template is not a compiled one"
+        ),
+    }
     if !chat.controls_thinking()
         && (!chat.opts.thinking || chat.opts.effort != ChatOptions::default().effort)
     {

@@ -220,6 +220,18 @@ pub fn stack(
         "generation.draft",
         c.draft.unwrap_or_else(|| engine.draft_size()),
     );
+    // the renderer of the prompts: a compiled chat template, or the built-in formats
+    let template = gguf
+        .metadata
+        .tokenizer
+        .chat_template
+        .as_deref()
+        .and_then(biv::template::Template::recognize)
+        .filter(|_| !c.builtin_format);
+    f.push(
+        "generation.chat_template",
+        template.map_or("builtin", |t| t.name()),
+    );
     f.push("generation.thinking", c.thinking);
     f.push(
         "generation.effort",

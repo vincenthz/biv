@@ -1,12 +1,19 @@
-//! Multi-turn chat on top of the model, following the GGUF's chat template:
-//! ChatML with `<think>` reasoning blocks (Qwen 3.5), or Flint's role tokens
-//! (`<|user|>`, `<|assistant|>`, …), told apart by the vocabulary.
+//! Multi-turn chat on top of the model, following the GGUF's chat template.
+//! When it is one of the templates compiled into [`crate::template`], found by
+//! the hash of its text, that code renders the prompts. Otherwise built-in
+//! formats do: ChatML with `<think>` reasoning blocks (Qwen), or Flint's role
+//! tokens (`<|user|>`, `<|assistant|>`, …), told apart by the vocabulary. The
+//! format, from the vocabulary either way, is what reads the answers: the
+//! reasoning blocks, the function calls, the end of an answer.
 //!
-//! The templates keep past reasoning in the history (Qwen's `preserve_thinking`
-//! defaults to true), so every turn only appends to the sequence: the model
-//! state is kept between turns and only the new tokens are processed. This
-//! also suits the recurrent layers, whose state cannot be rewound (beyond the
-//! last verify pass of speculative decoding).
+//! Every turn only appends to the sequence: the model state is kept between
+//! turns and only the new tokens are processed. This suits the recurrent
+//! layers, whose state cannot be rewound (beyond the last verify pass of
+//! speculative decoding), and is why past reasoning stays in the history
+//! (`preserve_thinking`), even with templates that would drop it. An answer
+//! stays as the model generated it: a turn renders only what follows it, the
+//! template's end of the answer and the new messages, from a conversation
+//! where stand-ins take the place of those before (see [`Chat::template_turn`]).
 //!
 //! With tools, the model may answer with function calls ([`Event::ToolCall`]),
 //! whose results go back with [`Chat::send_tool_responses`].
@@ -27,6 +34,7 @@ use crate::engine::{DraftLogits, Engine, Session, Snapshot};
 use crate::memory::SessionMemory;
 use crate::prelude::*;
 use crate::sampler::Sampler;
+use crate::template::{self as compiled, rt};
 use crate::tokenizer::{PromptPart, StreamDecoder, TokenId, Tokenizer};
 pub use crate::transcript::Transcript;
 
@@ -150,6 +158,15 @@ impl ReasoningEffort {
         })
     }
 
+    /// As chat templates name it (`reasoning_effort`)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::XHigh => "xhigh",
+        }
+    }
+
     /// The system instruction the template adds when thinking is enabled
     fn instructions(self) -> Option<&'static str> {
         match self {
@@ -186,8 +203,13 @@ pub struct ChatOptions {
     pub lookup: usize,
     /// functions the model may call, each a JSON object as the chat template's
     /// `tojson` writes it, e.g. `{"type": "function", "function": {"name":
-    /// "get_weather", "description": "...", "parameters": {...}}}`
+    /// "get_weather", "description": "...", "parameters": {...}}}`. A compiled
+    /// template writes it again from its `name`, `description` and
+    /// `parameters`, the other keys left out.
     pub tools: Vec<String>,
+    /// render the prompts with the built-in formats even when the model's
+    /// chat template is a compiled one
+    pub builtin_format: bool,
 }
 
 impl Default for ChatOptions {
@@ -202,6 +224,7 @@ impl Default for ChatOptions {
             draft: None,
             lookup: 0,
             tools: Vec::new(),
+            builtin_format: false,
         }
     }
 }
@@ -355,9 +378,74 @@ pub struct Chat<'m> {
     /// consecutive steps whose proposal from the conversation was all right
     lookup_run: usize,
     format: Format,
+    /// the compiled chat template that renders the prompts, if any
+    template: Option<compiled::Template>,
     think_end: TokenId,
     tool_call: TokenId,
     tool_call_end: TokenId,
+}
+
+/// Stand-ins for the messages before a turn, see [`Chat::template_turn`]:
+/// text no message has, which the templates write as it is (private use
+/// characters, not whitespace)
+const STAND_IN_QUERY: &str = "\u{f8fe}";
+const STAND_IN_ANSWER: &str = "\u{f8ff}";
+
+/// A tool of [`ChatOptions::tools`] as the compiled templates take it
+fn parse_tool(json: &str) -> Result<rt::Tool, Error> {
+    let bad = |why: &str| Error::Template(format!("tool {json:?}: {why}"));
+    let j = rt::Json::parse(json).map_err(|e| bad(&e.0))?;
+    let f = j.get("function").unwrap_or(&j);
+    let Some(name) = f.get("name").and_then(rt::Json::as_str) else {
+        return Err(bad("no name"));
+    };
+    Ok(rt::Tool {
+        name: name.into(),
+        description: f
+            .get("description")
+            .and_then(rt::Json::as_str)
+            .map(Into::into),
+        parameters: f
+            .get("parameters")
+            .cloned()
+            .unwrap_or(rt::Json::Object(Vec::new())),
+    })
+}
+
+/// The tokenizer's parts of a rendered prompt
+fn prompt_parts(s: &rt::Str) -> Vec<PromptPart<'_>> {
+    s.0.iter()
+        .map(|seg| {
+            if seg.lit {
+                Template(&seg.text)
+            } else {
+                Content(&seg.text)
+            }
+        })
+        .collect()
+}
+
+/// What follows `mark`, data of `s`
+fn after(s: &rt::Str, mark: &str) -> Option<rt::Str> {
+    let i =
+        s.0.iter()
+            .position(|seg| !seg.lit && seg.text.contains(mark))?;
+    let seg = &s.0[i];
+    let at = seg.text.find(mark)? + mark.len();
+    let mut rest = rt::Str::default();
+    rest.push(&seg.text[at..], false);
+    for seg in &s.0[i + 1..] {
+        rest.push(&seg.text, seg.lit);
+    }
+    Some(rest)
+}
+
+/// The longest end of `a` that starts `b`
+fn overlap(a: &[TokenId], b: &[TokenId]) -> usize {
+    (0..=a.len().min(b.len()))
+        .rev()
+        .find(|&k| a[a.len() - k..] == b[..k])
+        .unwrap_or(0)
 }
 
 impl<'m> Chat<'m> {
@@ -378,6 +466,11 @@ impl<'m> Chat<'m> {
                 im_end: id("<|im_end|>")?,
             }
         };
+        let template = if opts.builtin_format {
+            None
+        } else {
+            tok.chat_template().and_then(compiled::Template::recognize)
+        };
         Ok(Chat {
             engine,
             tok,
@@ -388,6 +481,7 @@ impl<'m> Chat<'m> {
             history: Vec::new(),
             lookup_run: 0,
             format,
+            template,
             think_end: id("</think>")?,
             tool_call: id("<tool_call>")?,
             tool_call_end: id("</tool_call>")?,
@@ -409,6 +503,13 @@ impl<'m> Chat<'m> {
 
     pub fn n_past(&self) -> usize {
         self.session.n_past()
+    }
+
+    /// The compiled chat template that renders the prompts, or `None` for the
+    /// built-in formats: the model's template is not a compiled one, or
+    /// [`ChatOptions::builtin_format`]
+    pub fn template(&self) -> Option<compiled::Template> {
+        self.template
     }
 
     /// Whether [`ChatOptions::thinking`] and [`ChatOptions::effort`] have an
@@ -433,10 +534,15 @@ impl<'m> Chat<'m> {
     /// is processed now, so that the prefix holds it.
     pub fn save(&mut self) -> Result<Prefix, Error> {
         if self.session.n_past() == 0 {
-            let mut parts = Vec::new();
-            let prompt = self.system_prompt();
-            self.system_block(prompt.as_deref(), &mut parts);
-            let system = self.tok.encode_prompt(&parts);
+            let system = match self.template {
+                Some(t) => self.opening(t)?,
+                None => {
+                    let mut parts = Vec::new();
+                    let prompt = self.system_prompt();
+                    self.system_block(prompt.as_deref(), &mut parts);
+                    self.tok.encode_prompt(&parts)
+                }
+            };
             if system.len() >= self.opts.context {
                 return Err(Error::ContextFull {
                     n_past: 0,
@@ -550,6 +656,113 @@ impl<'m> Chat<'m> {
         }
     }
 
+    /// The parameters of the compiled templates
+    fn template_params<'p>(
+        &self,
+        messages: &'p [rt::Message],
+        tools: &'p [rt::Tool],
+        generation: bool,
+    ) -> compiled::Params<'p> {
+        compiled::Params {
+            messages,
+            tools,
+            add_generation_prompt: generation,
+            enable_thinking: Some(self.opts.thinking),
+            // the history keeps past reasoning, see the module
+            preserve_thinking: Some(true),
+            reasoning_effort: Some(self.opts.effort.as_str()),
+            add_vision_id: false,
+        }
+    }
+
+    /// `messages` after the system prompt, rendered by the compiled template `t`
+    fn render(
+        &self,
+        t: compiled::Template,
+        messages: &[rt::Message],
+        generation: bool,
+    ) -> Result<rt::Str, Error> {
+        let tools = self
+            .opts
+            .tools
+            .iter()
+            .map(|t| parse_tool(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut all = Vec::with_capacity(messages.len() + 1);
+        if let Some(system) = self.opts.system.as_deref().filter(|s| !s.trim().is_empty()) {
+            all.push(rt::Message::new(rt::Role::System, system));
+        }
+        all.extend_from_slice(messages);
+        t.render(&self.template_params(&all, &tools, generation))
+            .map_err(|e| Error::Template(e.0))
+    }
+
+    fn encode(&self, s: &rt::Str) -> Vec<TokenId> {
+        self.tok.encode_prompt(&prompt_parts(s))
+    }
+
+    /// What the compiled template `t` writes before the first message, as far
+    /// as [`Chat::save`] processes it: up to the last special token before
+    /// the message's text (`<|im_start|>` of `<|im_start|>user\n`, `<|user|>`),
+    /// where conversations with another first message part
+    fn opening(&self, t: compiled::Template) -> Result<Vec<TokenId>, Error> {
+        let first = |q: &str| -> Result<Vec<TokenId>, Error> {
+            let query = [rt::Message::new(rt::Role::User, q)];
+            Ok(self.encode(&self.render(t, &query, false)?))
+        };
+        let (mut a, b) = (first(STAND_IN_QUERY)?, first(STAND_IN_ANSWER)?);
+        let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        let cut = a[..common]
+            .iter()
+            .rposition(|&id| self.tok.is_special(id))
+            .unwrap_or(0);
+        a.truncate(cut);
+        Ok(a)
+    }
+
+    /// The tokens of the next turn with the compiled template `t`: what is left
+    /// of the previous answer, `messages` and the generation prompt.
+    ///
+    /// Before the first answer, the conversation is rendered whole, less what
+    /// [`Chat::save`] processed of it. After it, the answers are in the history
+    /// as the model generated them, and the template renders `messages` after
+    /// stand-ins for the conversation so far: a query, then an answer whose
+    /// text marks where the turn starts, at the template's end of the answer.
+    /// The end token the model generated ([`Chat::pending`]) starts it already.
+    fn template_turn(
+        &self,
+        t: compiled::Template,
+        messages: &[rt::Message],
+    ) -> Result<Vec<TokenId>, Error> {
+        if self.generated.is_empty() {
+            let tokens = self.encode(&self.render(t, messages, true)?);
+            if self.session.n_past() == 0 {
+                return Ok(tokens);
+            }
+            let opening = self.opening(t)?;
+            return match tokens.strip_prefix(opening.as_slice()) {
+                Some(rest) => Ok(rest.to_vec()),
+                None => Err(Error::Template(
+                    "the first message changes what comes before it".into(),
+                )),
+            };
+        }
+        let mut all = vec![
+            rt::Message::new(rt::Role::User, STAND_IN_QUERY),
+            rt::Message::new(rt::Role::Assistant, STAND_IN_ANSWER),
+        ];
+        all.extend_from_slice(messages);
+        let rendered = self.render(t, &all, true)?;
+        let Some(rest) = after(&rendered, STAND_IN_ANSWER) else {
+            return Err(Error::Template("an answer's text is not written".into()));
+        };
+        let tokens = self.encode(&rest);
+        let k = overlap(&self.pending, &tokens);
+        let mut out = self.pending.clone();
+        out.extend_from_slice(&tokens[k..]);
+        Ok(out)
+    }
+
     /// The system prompt as the chat template writes it, if any
     fn system_prompt(&self) -> Option<Cow<'_, str>> {
         let system = self.opts.system.as_deref()?;
@@ -610,8 +823,9 @@ impl<'m> Chat<'m> {
         parts.push(Template("<|im_end|>\n"));
     }
 
-    /// The tokens of the next turn: what is left of the previous answer, the
-    /// system block on the first turn, `message` and the generation prompt
+    /// The tokens of the next turn in the built-in format: what is left of the
+    /// previous answer, the system block on the first turn, `message` and the
+    /// generation prompt
     fn turn_tokens(&self, message: &[PromptPart<'_>]) -> Vec<TokenId> {
         let chatml = matches!(self.format, Format::ChatMl { .. });
         let system = self.system_prompt();
@@ -647,13 +861,14 @@ impl<'m> Chat<'m> {
         on_event: impl FnMut(Event<'_>),
         stop: impl Fn() -> bool,
     ) -> Result<TurnStats, Error> {
-        let prompt = match self.format {
-            Format::ChatMl { .. } => self.turn_tokens(&[
+        let prompt = match (self.template, self.format) {
+            (Some(t), _) => self.template_turn(t, &[rt::Message::new(rt::Role::User, user)])?,
+            (None, Format::ChatMl { .. }) => self.turn_tokens(&[
                 Template("<|im_start|>user\n"),
                 Content(user.trim()),
                 Template("<|im_end|>\n"),
             ]),
-            Format::Flint { .. } => {
+            (None, Format::Flint { .. }) => {
                 self.turn_tokens(&[Template("<|user|>"), Content(&flint_text(user))])
             }
         };
@@ -669,6 +884,14 @@ impl<'m> Chat<'m> {
         on_event: impl FnMut(Event<'_>),
         stop: impl Fn() -> bool,
     ) -> Result<TurnStats, Error> {
+        if let Some(t) = self.template {
+            let messages: Vec<rt::Message> = responses
+                .iter()
+                .map(|r| rt::Message::new(rt::Role::Tool, r.as_ref()))
+                .collect();
+            let prompt = self.template_turn(t, &messages)?;
+            return self.answer(prompt, sampler, on_event, stop);
+        }
         let flint: Vec<Cow<'_, str>> = match self.format {
             Format::ChatMl { .. } => Vec::new(),
             Format::Flint { .. } => responses.iter().map(|r| flint_text(r.as_ref())).collect(),

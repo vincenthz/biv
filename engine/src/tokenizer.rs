@@ -47,6 +47,8 @@ pub struct Tokenizer {
     pub eos: TokenId,
     /// tokens that end a generation
     pub eog: Vec<TokenId>,
+    /// `tokenizer.chat_template`, the Jinja that renders conversations
+    chat_template: Option<String>,
 }
 
 /// One BPE merge of a left token, which [`Merges`] files it under
@@ -398,7 +400,13 @@ impl Tokenizer {
             bos: ggml.bos_token_id,
             eos,
             eog,
+            chat_template: m.tokenizer.chat_template.clone(),
         })
+    }
+
+    /// The GGUF's chat template, the Jinja that renders conversations
+    pub fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
     }
 
     pub fn n_vocab(&self) -> usize {

@@ -64,6 +64,9 @@ pub enum Error {
     Snapshot(&'static str),
     /// A transcript that can't be read, or restored in this chat
     Transcript(&'static str),
+    /// The chat template refused the conversation (its `raise_exception`), or
+    /// a tool that is not a JSON object with a name
+    Template(String),
     /// The GPU backend failed: no device, shader compilation, ...
     Backend(String),
 }
@@ -113,6 +116,7 @@ impl fmt::Display for Error {
             }
             Error::Snapshot(why) => write!(f, "cannot restore the snapshot: {why}"),
             Error::Transcript(why) => write!(f, "invalid transcript: {why}"),
+            Error::Template(why) => write!(f, "chat template: {why}"),
             Error::Backend(msg) => f.write_str(msg),
         }
     }

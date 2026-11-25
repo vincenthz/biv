@@ -27,6 +27,7 @@ pub mod model;
 pub mod ops;
 pub mod quant;
 pub mod sampler;
+pub mod template;
 pub mod tokenizer;
 pub mod transcript;
 

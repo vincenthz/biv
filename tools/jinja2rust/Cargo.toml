@@ -1,0 +1,12 @@
+[package]
+name = "jinja2rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+# a standalone tool, outside the biv workspace
+[workspace]
+
+[dependencies]
+minijinja = { version = "3", default-features = false, features = ["unstable_machinery", "macros", "loop_controls"] }
