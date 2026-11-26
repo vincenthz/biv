@@ -1,10 +1,57 @@
 //! The memory a model and its sessions take: estimated from the GGUF alone,
 //! then checked against sessions made on each backend.
 //! `memory <gguf> [context...]`
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
 use biv::engine::Engine;
 use biv::memory::{Backend, Footprint, SessionMemory};
 use biv::model::Model;
 use biv::sampler::argmax;
+
+/// The system allocator, counting the bytes live and their peak: what the
+/// CPU's passes allocate, against [`SessionMemory::transient`]
+struct Counting;
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn grow(bytes: usize) {
+    let live = LIVE.fetch_add(bytes, Relaxed) + bytes;
+    PEAK.fetch_max(live, Relaxed);
+}
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        grow(l.size());
+        unsafe { System.alloc(l) }
+    }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        grow(l.size());
+        unsafe { System.alloc_zeroed(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) };
+        LIVE.fetch_sub(l.size(), Relaxed);
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        match new >= l.size() {
+            true => grow(new - l.size()),
+            false => _ = LIVE.fetch_sub(l.size() - new, Relaxed),
+        }
+        unsafe { System.realloc(p, l, new) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+/// The peak of the bytes allocated by `f` beyond those live before
+fn peak<R>(f: impl FnOnce() -> R) -> (usize, R) {
+    let base = LIVE.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let r = f();
+    (PEAK.load(Relaxed) - base, r)
+}
 
 fn mb(bytes: usize) -> String {
     format!("{:.1} MB", bytes as f64 / 1e6)
@@ -30,14 +77,23 @@ fn check(name: &str, engine: &dyn Engine, estimate: SessionMemory, context: usiz
     let measured = s.memory();
     let after = engine.device_memory();
     let n = 300.min(context - 8);
-    let logits = s.forward(&vec![9707; n]);
+    s.prefill(&vec![9707; n]);
+    // a pass of the engine's batch size, and verify passes: on the CPU, what
+    // they allocate is the transient
+    let room = context.saturating_sub(n + 8 + 4 * (draft + 1));
+    let batch = engine.batch_size().min(room).max(1);
+    let (mut transient, logits) = peak(|| s.forward(&vec![9707; batch]));
     let mut next = argmax(&logits) as u32;
     for _ in 0..4 {
         let drafts = s.draft(next, draft, &mut |l| l.argmax());
         let mut tokens = vec![next];
         tokens.extend(&drafts);
-        let logits = s.verify(&tokens);
-        s.keep(1);
+        let (bytes, logits) = peak(|| {
+            let logits = s.verify(&tokens);
+            s.keep(1);
+            logits
+        });
+        transient = transient.max(bytes);
         next = argmax(&logits[0]) as u32;
     }
     let same = if measured == estimate {
@@ -55,6 +111,18 @@ fn check(name: &str, engine: &dyn Engine, estimate: SessionMemory, context: usiz
         s.n_past(),
         mb(measured.kv_used(s.n_past()))
     );
+    if name == "cpu" {
+        println!(
+            "    passes allocated at most {} of the estimated transient {}{}",
+            mb(transient),
+            mb(estimate.transient),
+            if transient > estimate.transient {
+                ": MORE"
+            } else {
+                ""
+            }
+        );
+    }
     if let (Some(b), Some(a)) = (before, after) {
         let up = a.allocated - b.allocated;
         println!(

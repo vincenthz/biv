@@ -1,5 +1,5 @@
 //! GPT-2 style byte-level BPE, as stored in GGUF (`tokenizer.ggml.model = gpt2`)
-//! with the `qwen35` or `flint` pre-tokenizer.
+//! with the `qwen35`, `flint` or `inkling2` pre-tokenizer.
 
 use core::cmp::Ordering;
 
@@ -28,6 +28,9 @@ pub enum PromptPart<'a> {
 enum Pre {
     Qwen35,
     Flint,
+    /// o200k's split, and a piece that is a token is that token, whatever
+    /// the merges would make of it (`ignore_merges`)
+    Inkling2,
 }
 
 pub struct Tokenizer {
@@ -282,6 +285,7 @@ impl Tokenizer {
         let pre = match (model.as_str(), pre_name) {
             ("gpt2", "qwen35") => Pre::Qwen35,
             ("gpt2", "flint") => Pre::Flint,
+            ("gpt2", "inkling2") => Pre::Inkling2,
             _ => {
                 return Err(Error::UnsupportedTokenizer {
                     model: model.clone(),
@@ -499,7 +503,29 @@ impl Tokenizer {
                 }
             }
             Pre::Flint => flint_split(text, |piece| self.bpe(piece.as_bytes(), &mut scratch, out)),
+            Pre::Inkling2 => {
+                let mut encoded = String::new();
+                for piece in inkling2_split(text) {
+                    match self.whole_token(piece, &mut encoded) {
+                        Some(id) => out.push(id),
+                        None => self.bpe(piece.as_bytes(), &mut scratch, out),
+                    }
+                }
+            }
         }
+    }
+
+    /// The token whose text is all of `piece`, if any, as `ignore_merges`
+    /// has it: looked up by the text in the vocabulary's encoding, which is
+    /// built in `encoded`. Special tokens, whose text is raw, are not.
+    fn whole_token(&self, piece: &str, encoded: &mut String) -> Option<TokenId> {
+        encoded.clear();
+        for b in piece.bytes() {
+            encoded.push_str(&self.tokens[self.byte_tokens[b as usize] as usize]);
+        }
+        self.by_text
+            .find(&self.tokens, encoded, "")
+            .filter(|&id| !self.is_special[id as usize])
     }
 
     fn bpe(&self, piece: &[u8], scratch: &mut Bpe, out: &mut Vec<TokenId>) {
@@ -854,6 +880,98 @@ fn contraction(s: &str, at: usize) -> usize {
     }
 }
 
+/// The `inkling2` pre-tokenizer, o200k's (GPT-4o's), as Hugging Face
+/// `tokenizers` has it: the matches of one regex, which cover the text
+///
+/// ```text
+/// [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+/// |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+/// |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// ```
+///
+/// matched by hand. Its letter alternatives are flint's; unlike flint's
+/// split, numbers and CJK are not split off first. llama.cpp's matcher
+/// (`LLAMA_VOCAB_PRE_TYPE_GPT4O`) has the letter classes as "not `a-z`" and
+/// "not `A-Z`", every non-ASCII letter in both, and ASCII-only contractions:
+/// it splits text where an upper case non-ASCII letter meets a letter of the
+/// other case (`helloÉcole`, `ÉCOLE`) and `'ſ` otherwise.
+fn inkling2_split(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    core::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (piece, tail) = rest.split_at(inkling2_len(rest));
+        rest = tail;
+        Some(piece)
+    })
+}
+
+/// Byte length of the piece of [`inkling2_split`] at the start of `s`, not
+/// empty: the first alternative of the regex that matches there, as long as
+/// backtracking makes it
+fn inkling2_len(s: &str) -> usize {
+    use Flint::*;
+    let c0 = s.chars().next().expect("a piece of an empty text");
+    let k0 = flint_class(c0);
+    let upper = |c| matches!(flint_class(c), Upper | Both);
+    let lower = |c| matches!(flint_class(c), Lower | Both);
+    // [^\r\n\p{L}\p{N}]?, taken first. A mark is a letter too, and both
+    // ways give the same match then.
+    let prefixes: &[usize] =
+        if !matches!(c0, '\r' | '\n') && !matches!(k0, Upper | Lower | Both | Number) {
+            &[c0.len_utf8(), 0]
+        } else {
+            &[0]
+        };
+    // [upper]*[lower]+: the upper run, given back a char at a time
+    for &p in prefixes {
+        let mut k = run(s, p, upper);
+        loop {
+            let end = run(s, k, lower);
+            if end > k {
+                return contraction(s, end);
+            }
+            if k == p {
+                break;
+            }
+            k -= s[..k].chars().next_back().map_or(1, char::len_utf8);
+        }
+    }
+    // [upper]+[lower]*
+    for &p in prefixes {
+        let k = run(s, p, upper);
+        if k > p {
+            return contraction(s, run(s, k, lower));
+        }
+    }
+    // \p{N}{1,3}
+    if k0 == Number {
+        let digits = run(s, 0, |c| flint_class(c) == Number);
+        return s[..digits].char_indices().nth(3).map_or(digits, |(i, _)| i);
+    }
+    // ' ?[^\s\p{L}\p{N}]+[\r\n/]*': marks, controls and the unassigned are
+    // in the class, with punctuation and symbols
+    let other = |c| matches!(class(c), Class::Mark | Class::Other);
+    let start = (c0 == ' ' && s[1..].starts_with(other)) as usize;
+    let end = run(s, start, other);
+    if end > start {
+        return run(s, end, |c| matches!(c, '\r' | '\n' | '/'));
+    }
+    // whitespace is left: \s*[\r\n]+|\s+(?!\S)|\s+, as in [`piece_len`]
+    debug_assert!(k0 == Space);
+    let ws = run(s, 0, |c| flint_class(c) == Space);
+    if let Some(nl) = s[..ws].rfind(['\r', '\n']) {
+        return nl + 1;
+    }
+    let last = s[..ws].chars().next_back().map_or(0, char::len_utf8);
+    if ws == s.len() || ws == last {
+        ws
+    } else {
+        ws - last
+    }
+}
+
 /// Turns a stream of tokens into text, holding back incomplete UTF-8 sequences
 #[derive(Default)]
 pub struct StreamDecoder {
@@ -886,7 +1004,7 @@ impl StreamDecoder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1042,6 +1160,233 @@ mod tests {
             let text: String = (0..len).map(|_| pool[rand(pool.len())]).collect();
             check(&text);
         }
+    }
+
+    /// The regex of the inkling2 pre-tokenizer, as in its `tokenizer.json`
+    const INKLING2_PRE: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    #[test]
+    fn inkling2_split_matches_regex() {
+        let re = fancy_regex::Regex::new(INKLING2_PRE).unwrap();
+        let check = |text: &str| {
+            let want: Vec<&str> = re.find_iter(text).map(|m| m.unwrap().as_str()).collect();
+            let got: Vec<&str> = inkling2_split(text).collect();
+            assert_eq!(got, want, "split of {text:?}");
+        };
+        for text in [
+            "",
+            "Hello world! It's 2026, isn't it?   ok\n\n  x",
+            "camelCaseWord HTTPServer XMLHttpRequest iPhone McDonald's",
+            "parseHttpServerConfig ABCdef DON'T we'LL 'S it'\u{17f}   'll",
+            "helloÉcole aÉb ÉCOLE École ΑθήναΑθήνα xÀy ǅungla ǈ",
+            "1234567 12.5 3,000,000 x  3 ½² x1y22z333w4444 a1b x² Ⅻ ٣",
+            "日本語のテキストとカタカナ・ー中文abc ABC中def 한국어",
+            "e\u{301}t\u{e9} \u{301}x \u{301}ABC !!\u{301} नमस्ते 🦀",
+            "a/b!/\n/x \r\n/ path/to/file.txt\n// comment\n(bar)+1;\n",
+            "  \t\n \r\n  trailing   ",
+            "\u{0}\u{0}a \u{200d}\u{200d} b\u{feff} x\u{200d}y\u{feff} \u{f8fe}\u{f8ff}",
+            "a\u{a0}\u{a0}b\u{3000}c \u{2028}d \u{85}x\u{85}y \u{1c}\u{1f} \u{b}\u{c}",
+            "<|message_user|><|content_text|>Hi<|end_message|>",
+        ] {
+            check(text);
+        }
+        let pool = [
+            "a",
+            "Z",
+            "é",
+            "É",
+            "e\u{301}",
+            "\u{301}",
+            "\u{903}",
+            "\u{20dd}",
+            "ß",
+            "ǅ",
+            "ʰ",
+            "ª",
+            "Ω",
+            "ω",
+            "中",
+            "の",
+            "ア",
+            "ー",
+            "・",
+            "한",
+            "😀",
+            "👍🏽",
+            "\u{200d}",
+            "\u{feff}",
+            "\u{e000}",
+            "\u{378}",
+            "0",
+            "9",
+            "12",
+            "½",
+            "Ⅻ",
+            "٣",
+            "²",
+            "क",
+            "ि",
+            "्",
+            " ",
+            "  ",
+            "\t",
+            "\n",
+            "\r",
+            "\r\n",
+            "\u{a0}",
+            "\u{3000}",
+            "\u{2028}",
+            "\u{85}",
+            "\u{b}",
+            "\u{c}",
+            "\u{0}",
+            "\u{1c}",
+            "\u{1f}",
+            "\u{7f}",
+            "'",
+            "'s",
+            "'S",
+            "'\u{17f}",
+            "'re",
+            "'VE",
+            "'lL",
+            "'d",
+            "'m",
+            "'t",
+            "'x",
+            "'r",
+            "'l",
+            ".",
+            ",",
+            "!",
+            "-",
+            "_",
+            "(",
+            "\"",
+            "/",
+            "//",
+            "$",
+            "€",
+            "+",
+            "^",
+            "`",
+            "<|end_message|>",
+        ];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..100_000 {
+            let len = 1 + rand(12);
+            let text: String = (0..len).map(|_| pool[rand(pool.len())]).collect();
+            check(&text);
+        }
+    }
+
+    /// The tokenizer of Inkling-2-Mini's GGUF, from `BIV_INKLING2_GGUF` or the
+    /// Hugging Face cache, if there: only the start of the file is read
+    pub(crate) fn inkling2() -> Option<Tokenizer> {
+        use std::io::Read;
+        let path = match std::env::var_os("BIV_INKLING2_GGUF") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => {
+                let snapshots = std::path::Path::new(&std::env::var_os("HOME")?)
+                    .join(".cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots");
+                std::fs::read_dir(snapshots)
+                    .ok()?
+                    .flatten()
+                    .map(|d| d.path().join("Inkling-2-Mini-Q8_0.gguf"))
+                    .find(|p| p.exists())?
+            }
+        };
+        // the metadata is the first 12 MB
+        let mut head = Vec::new();
+        std::fs::File::open(&path)
+            .ok()?
+            .take(32 << 20)
+            .read_to_end(&mut head)
+            .ok()?;
+        Some(Tokenizer::from_gguf_bytes(&head).unwrap())
+    }
+
+    /// Hugging Face `tokenizers`' ids with Inkling-2's `tokenizer.json`
+    #[test]
+    fn inkling2_encodes_as_hugging_face() {
+        let Some(tok) = inkling2() else {
+            std::eprintln!("no Inkling-2-Mini GGUF: skipped");
+            return;
+        };
+        assert_eq!(tok.pre, Pre::Inkling2);
+        assert_eq!(
+            (tok.bos, tok.eos, &tok.eog[..]),
+            (None, 200006, &[200006, 199999][..])
+        );
+        #[rustfmt::skip]
+        let vectors: &[(&str, &[TokenId])] = &[
+            ("Hello world", &[32269, 150770]),
+            (" Hello world", &[188766, 150770]),
+            ("Hello  world", &[32269, 220, 150770]),
+            ("Hello\nworld", &[32269, 198, 1966]),
+            ("Hello \n\n world", &[32269, 150148, 150770]),
+            ("camelCaseWord HTTPServer XMLHttpRequest iPhone McDonald's", &[39907, 4474, 4164, 198447, 52861, 198420, 31126, 43683, 149900, 31329, 152065, 31091, 6, 82]),
+            ("I'm you're they'LL DON'T it'S", &[40, 6, 76, 149941, 6, 261, 150051, 6, 145896, 199445, 6, 51, 149921, 6, 50]),
+            ("helloÉcole aÉb ÉCOLE École", &[32205, 5195, 37105, 149878, 5195, 65, 150802, 145889, 145876, 150802, 37105]),
+            ("naïve café résumé Ångström", &[1364, 5169, 290, 162389, 150182, 118188, 159224, 3068, 110559]),
+            ("1234567 12.5 3,000,000", &[70904, 81554, 22, 220, 68040, 13, 20, 220, 18, 11, 68128, 11, 68128]),
+            ("x = foo(bar)+1;\n\treturn x\r\n", &[87, 196977, 173339, 7, 1206, 8, 10, 16, 26, 198, 197, 65108, 149924, 68247]),
+            ("  leading and trailing  ", &[220, 154384, 149880, 162610, 279, 149859]),
+            ("path/to/file.txt\n// comment\n", &[1448, 14, 278, 14, 1082, 13, 4352, 198, 145055, 151522, 198]),
+            ("😀👍🏽 中文测试 日本語 한국어", &[110689, 76858, 69389, 220, 114903, 116305, 220, 90626, 22912, 220, 91422, 27040]),
+            ("Thinking effort level: 0.9", &[34182, 279, 154554, 150628, 25, 220, 15, 13, 24]),
+            ("Ⅻ ½ ² ٣", &[149826, 220, 5153, 220, 5142, 220, 119077]),
+            ("ǅungla ǈ", &[131, 227, 1873, 891, 220, 131, 230]),
+            ("\u{a0}nbsp\u{2003}emsp", &[1377, 32054, 1403, 397, 694]),
+            ("'s 'S 'ſ", &[6, 82, 196984, 50, 196984, 5313]),
+            ("tab\tsep\t\tx", &[4338, 197, 33408, 197, 197, 87]),
+            ("\n \n\n \n\n\n \t \t\t \t\n  \n   \n    \n     \n🚀 (normal) 😶\u{200d}🌫\u{fe0f} (multiple emojis concatenated) ✅ 🦙🦙 3 33 333 3333 33333 333333 3333333 33333333 3.3 3..3 3...3 ក\u{17b6}ន\u{17cb}ត\u{17c2}ព\u{17b7}ស\u{17c1}សអ\u{17b6}ច😁 ?我想在apple工作1314151天～ ------======= нещо на Български ''''''```````\"\"\"\"......!!!!!!?????? I've been 'told he's there, 'RE you sure? 'M not sure I'll make it, 'D you like some tea? We'Ve a'lL", &[198, 150148, 150213, 220, 197, 220, 68038, 220, 77928, 149865, 149867, 149871, 149874, 108185, 196976, 32443, 8, 220, 104216, 70363, 104667, 196976, 71764, 162033, 40221, 220, 103137, 54734, 8, 220, 101053, 220, 109184, 109184, 220, 18, 220, 68278, 220, 73886, 220, 73886, 18, 220, 73886, 68278, 220, 73886, 73886, 220, 73886, 73886, 18, 220, 73886, 73886, 68278, 220, 18, 13, 18, 220, 18, 145039, 18, 220, 18, 145038, 18, 220, 19018, 85297, 25833, 133702, 131045, 129228, 19048, 121733, 19023, 116484, 196974, 15501, 10422, 23225, 4339, 94922, 72759, 85415, 16, 24596, 25753, 220, 89995, 111234, 28, 150017, 69213, 149945, 150345, 120895, 72176, 220, 138952, 70041, 68289, 68289, 68790, 136529, 76736, 89087, 70042, 91628, 145059, 149904, 6, 290, 150116, 196984, 3248, 150026, 6, 82, 150102, 11, 196984, 145868, 149941, 151456, 30, 196984, 44, 149935, 151456, 149904, 6, 359, 150259, 149921, 11, 196984, 35, 149941, 150183, 150136, 159505, 30, 150197, 6, 3097, 149878, 6, 75, 43]),
+            // no BOS
+            ("hi", &[1910]),
+            ("kwargs", &[87550]),
+            ("Aleksandr", &[49919]),
+            (" kwargs", &[194390]),
+            ("a/b!/\n/x", &[64, 14, 65, 0, 14, 198, 14, 87]),
+            ("\r\n/", &[68247, 14]),
+            ("!!\u{301}", &[70042, 69195]),
+            ("x\u{200d}y\u{feff}", &[87, 70363, 88, 81362]),
+            ("日本語の文章", &[90626, 22912, 6084, 94540]),
+            ("e\u{301}cole", &[108114, 37105]),
+            ("Thinking effort level: 0.99", &[34182, 279, 154554, 150628, 25, 220, 15, 13, 68436]),
+            ("\u{f8fe}", &[72012, 122]),
+            ("\u{f8ff}", &[72012, 123]),
+            ("x  3", &[87, 220, 220, 18]),
+            ("\u{301}ABC", &[69195, 146104]),
+            ("it'ſ", &[271, 6, 5313]),
+            ("  'll", &[220, 196984, 359]),
+            ("\u{1}\u{2}a", &[189, 190, 64]),
+            ("x\u{85}y", &[87, 126, 227, 88]),
+            ("\u{1c}\u{1f}", &[216, 219]),
+            ("szükség", &[90239]),
+        ];
+        for &(text, ids) in vectors {
+            assert_eq!(tok.encode(text), ids, "{text:?}");
+            assert_eq!(tok.decode(ids), text);
+        }
+        // special tokens are split out of a template's text, alone; not of
+        // the content, unlike Hugging Face's [64, 200010, 65, 200054, 66]
+        let text = "a<|end_message|>b<|unused_200054|>c";
+        assert_eq!(tok.encode_with_special(text), [64, 200010, 65, 200054, 66]);
+        assert_eq!(
+            tok.encode_prompt(&[PromptPart::Content(text)]),
+            tok.encode(text)
+        );
+        // the merges alone would make [86226, 70, 82] of it
+        let mut scratch = Bpe::default();
+        let mut merged = Vec::new();
+        tok.bpe(b"kwargs", &mut scratch, &mut merged);
+        assert_eq!(merged, [86226, 70, 82]);
     }
 
     fn check(re: &fancy_regex::Regex, text: &str) {

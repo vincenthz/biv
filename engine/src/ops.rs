@@ -213,3 +213,30 @@ pub fn softmax_with_sink(x: &mut [f32], sink: f32) {
     let inv = 1.0 / sum;
     x.iter_mut().for_each(|v| *v *= inv);
 }
+
+/// RMS norm of each `group`-sized slice of `x`, without a weight:
+/// `x / sqrt(mean(x^2) + eps)`
+pub fn rms(x: &mut [f32], group: usize, eps: f32) {
+    for g in x.chunks_exact_mut(group) {
+        let ss = quant::dot_f32(g, g) / g.len() as f32;
+        let scale = 1.0 / (ss + eps).sqrt();
+        g.iter_mut().for_each(|v| *v *= scale);
+    }
+}
+
+/// Each `group`-sized slice of `x`, first times `scale` when given (a group
+/// of per-channel factors per slice, repeated when `x` has more slices),
+/// scaled down to an L2 norm of `thr` when longer: `x * thr / max(|x|, thr)`,
+/// as llama.cpp's `ggml_l2_norm(x, thr) * thr`. Not [`l2_norm`], which
+/// normalizes every slice.
+pub fn l2_clip(x: &mut [f32], group: usize, scale: Option<&[f32]>, thr: f32) {
+    for (i, g) in x.chunks_exact_mut(group).enumerate() {
+        if let Some(s) = scale {
+            let groups = s.len() / group;
+            let s = &s[(i % groups) * group..][..group];
+            g.iter_mut().zip(s).for_each(|(v, s)| *v *= s);
+        }
+        let inv = 1.0 / quant::dot_f32(g, g).sqrt().max(thr);
+        g.iter_mut().for_each(|v| *v = *v * inv * thr);
+    }
+}

@@ -160,6 +160,53 @@ node! {
         ssm_norm: Param,
         ssm_out: Param,
 
+        /// `inkling2_loop`: the attention's per-channel scales before the
+        /// clip of the queries `[n_head][head_dim]` and of the relative
+        /// position channels `[n_head][n_rel]`, the projections to the
+        /// per-head sink logits and to the relative position channels, and
+        /// the bias table `[distance][n_rel]` (`attn_gate` is the sigmoid
+        /// output gate)
+        attn_q_clip: Param,
+        attn_rel_clip: Param,
+        attn_sink_proj: Param,
+        attn_rel: Param,
+        attn_rel_bias: Param,
+        /// `inkling2_loop`: taps of the short convs `[channel][tap]`, of the
+        /// keys, values, attention output and feed-forward output, and the
+        /// projections to the keys' and values' dynamic taps
+        /// `[n_head_kv][tap]` (full attention layers)
+        attn_k_conv: Param,
+        attn_v_conv: Param,
+        attn_post_conv: Param,
+        ffn_post_conv: Param,
+        attn_k_conv_proj: Param,
+        attn_v_conv_proj: Param,
+        /// `inkling2_loop`: the input norms of the queries, keys and values
+        /// of the full attention layers (`attn_norm` for all three in the
+        /// others)
+        attn_q_inp_norm: Param,
+        attn_k_inp_norm: Param,
+        attn_v_inp_norm: Param,
+        /// `inkling2_loop`: the depth mixes' queries, of the attention inputs
+        /// `[n_q][n_embd]` and of the feed-forward input
+        attn_res_query: Param,
+        ffn_res_query: Param,
+        /// `inkling2_loop`, looped layers: the message queries `[4][n_embd]`
+        /// (queries, keys, values, feed-forward) and the controllers of each
+        loop_msg_query: Param,
+        loop_q_ctrl_down: Param,
+        loop_q_ctrl_gain: Param,
+        loop_q_ctrl_forget: Param,
+        loop_k_ctrl_down: Param,
+        loop_k_ctrl_gain: Param,
+        loop_k_ctrl_forget: Param,
+        loop_v_ctrl_down: Param,
+        loop_v_ctrl_gain: Param,
+        loop_v_ctrl_forget: Param,
+        loop_ffn_ctrl_down: Param,
+        loop_ffn_ctrl_gain: Param,
+        loop_ffn_ctrl_forget: Param,
+
         /// the MTP head on top of this layer
         nextn: Nextn,
     }
@@ -176,7 +223,11 @@ node! {
 #[derive(Debug, Clone, Default)]
 pub struct Tensors {
     pub token_embd: Param,
+    /// the norm of the embeddings (`inkling2_loop`)
+    pub token_embd_norm: Param,
     pub output_norm: Param,
+    /// the query of the depth mix before the output norm (`inkling2_loop`)
+    pub output_res_query: Param,
     pub output: Param,
     pub blk: Vec<Block>,
     /// tensors with no field, or a name already taken, in file order
@@ -190,7 +241,9 @@ impl Tensors {
         let (head, rest) = split(&name);
         let placed = match head {
             "token_embd" => self.token_embd.set(rest, t),
+            "token_embd_norm" => self.token_embd_norm.set(rest, t),
             "output_norm" => self.output_norm.set(rest, t),
+            "output_res_query" => self.output_res_query.set(rest, t),
             "output" => self.output.set(rest, t),
             "blk" => self.blk.set(rest, t),
             _ => Err(t),
@@ -205,7 +258,9 @@ impl Tensors {
         let (head, rest) = split(name);
         let field = match head {
             "token_embd" => self.token_embd.get(rest),
+            "token_embd_norm" => self.token_embd_norm.get(rest),
             "output_norm" => self.output_norm.get(rest),
+            "output_res_query" => self.output_res_query.get(rest),
             "output" => self.output.get(rest),
             "blk" => TensorField::get(&self.blk, rest),
             _ => None,

@@ -207,6 +207,11 @@ node! {
         qwen35moe: Hparams,
         /// the hyperparameters of the `flint` architecture
         flint: Hparams,
+        /// the hyperparameters of the `inkling2_loop` architecture. Its
+        /// per-layer head counts are arrays, which the scalar fields don't
+        /// take, and its `loop.*` keys have no field (`loop` is a keyword):
+        /// both are in `extra`, read with [`Gguf::get`](super::Gguf::get)
+        inkling2_loop: Hparams,
         tokenizer: Tokenizer,
         split: Split,
     }
@@ -270,6 +275,35 @@ node! {
         /// the first layers, which have a dense feed-forward instead of
         /// experts (`flint`)
         leading_dense_block_count: Option<u64>,
+
+        /// rows of the embeddings and output head, and the tokens of the
+        /// vocabulary, fewer (`inkling2_loop`)
+        vocab_size: Option<u64>,
+        vocab_size_unpadded: Option<u64>,
+        /// `cap * tanh(logit / cap)`, none when 0 (`inkling2_loop`)
+        final_logit_softcapping: Option<f32>,
+        attn_res: AttnRes,
+        activation: Activation,
+        shortconv: Shortconv,
+    }
+
+    /// the depth mixes of block outputs (`inkling2_loop`)
+    pub struct AttnRes {
+        /// layers of a block: the first of each starts a new residual stream
+        block_size: Option<u64>,
+    }
+
+    /// the SITU activation of the experts (`inkling2_loop`)
+    pub struct Activation {
+        situ_beta: Option<f32>,
+        situ_linear_beta: Option<f32>,
+    }
+
+    /// the short causal convolutions of the keys, values and layer outputs
+    /// (`inkling2_loop`)
+    pub struct Shortconv {
+        /// taps, the current token's included
+        l_cache: Option<u64>,
     }
 
     pub struct Attention {
@@ -286,6 +320,22 @@ node! {
         sliding_window_pattern: Option<Vec<bool>>,
         /// per layer, whether it has rotary embeddings (all when absent)
         rope_pattern: Option<Vec<bool>>,
+
+        /// head sizes of the sliding window layers (`inkling2_loop`)
+        key_length_swa: Option<u64>,
+        value_length_swa: Option<u64>,
+        /// the relative position bias: channels per head, and the distances
+        /// of the full attention layers' table (`inkling2_loop`)
+        relative_length: Option<u64>,
+        relative_extent: Option<u64>,
+        /// the L2 norm the queries and keys, and the relative position
+        /// channels, are clipped to (`inkling2_loop`)
+        qk_clip: Option<f32>,
+        relative_clip: Option<f32>,
+        /// the full attention layers' query scale `1 + alpha * ln(max(1,
+        /// (pos + 1) / floor))` (`inkling2_loop`)
+        log_scale_floor: Option<u64>,
+        log_scale_alpha: Option<f32>,
     }
 
     pub struct Rope {
@@ -357,3 +407,13 @@ macro_rules! need {
     };
 }
 pub(crate) use need;
+
+/// A per-layer value stored as one value for every layer or as an array of
+/// `n` (llama.cpp's `get_key_or_arr`); None when it is neither, or negative
+pub fn per_layer(v: &Value, n: usize) -> Option<Vec<u64>> {
+    match v.as_array() {
+        Some(a) if a.len() == n => a.iter().map(u64::from_value).collect(),
+        Some(_) => None,
+        None => u64::from_value(v).map(|x| vec![x; n]),
+    }
+}

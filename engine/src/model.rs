@@ -1,5 +1,5 @@
 //! The decoders of the llama.cpp archs `qwen35` and `qwen35moe` (Qwen3.5 /
-//! Qwen3.8), and `flint`.
+//! Qwen3.8), `flint`, and `inkling2_loop` (Inkling-2, in `model/inkling.rs`).
 //!
 //! Ported from llama.cpp `src/models/qwen35.cpp`, `qwen35moe.cpp`,
 //! `delta-net-base.cpp` and `flint.cpp`.
@@ -35,12 +35,16 @@ use crate::quant::{self, GgmlType};
 use crate::tokenizer::TokenId;
 use alloc::collections::VecDeque;
 
+pub(crate) mod inkling;
+pub use inkling::InklingConfig;
+
 /// The llama.cpp architecture of a model
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     Qwen35,
     Qwen35Moe,
     Flint,
+    Inkling2Loop,
 }
 
 impl Arch {
@@ -49,6 +53,7 @@ impl Arch {
             Arch::Qwen35 => "qwen35",
             Arch::Qwen35Moe => "qwen35moe",
             Arch::Flint => "flint",
+            Arch::Inkling2Loop => "inkling2_loop",
         }
     }
 }
@@ -90,6 +95,9 @@ pub struct Config {
     /// the first `n_dense_lead` layers
     pub moe: Option<MoeConfig>,
     pub n_dense_lead: usize,
+    /// the hyperparameters of `inkling2_loop`, whose layers are run by its
+    /// own code (`model/inkling.rs`) instead
+    pub inkling: Option<InklingConfig>,
 }
 
 /// How the router's logits become the experts' probabilities
@@ -127,6 +135,7 @@ impl Config {
             "qwen35" => (Arch::Qwen35, &m.qwen35),
             "qwen35moe" => (Arch::Qwen35Moe, &m.qwen35moe),
             "flint" => (Arch::Flint, &m.flint),
+            "inkling2_loop" => return Self::inkling(g),
             _ => return Err(Error::UnsupportedArchitecture(name.into())),
         };
         let arch_name = name;
@@ -182,6 +191,7 @@ impl Config {
             ssm_v_heads: 0,
             moe: None,
             n_dense_lead: 0,
+            inkling: None,
         };
 
         if arch == Arch::Flint {
@@ -450,6 +460,8 @@ pub struct Model<'a> {
     pub(crate) mtp: Option<Mtp<'a>>,
     pub(crate) inv_freq: Vec<f32>,
     pub(crate) memory: ModelMemory,
+    /// the layers of `inkling2_loop` (then `layers` is empty)
+    pub(crate) inkling: Option<Box<inkling::Inkling<'a>>>,
 }
 
 struct Loader<'g> {
@@ -665,6 +677,9 @@ impl<'g> Loader<'g> {
 impl<'a> Model<'a> {
     pub fn load(g: &'a Gguf) -> Result<Self, Error> {
         let cfg = Config::from_gguf(g)?;
+        if cfg.inkling.is_some() {
+            return Self::load_inkling(g, cfg);
+        }
         let l = Loader { g };
         let e = cfg.n_embd;
 
@@ -707,6 +722,7 @@ impl<'a> Model<'a> {
             layers,
             mtp,
             inv_freq,
+            inkling: None,
         })
     }
 
@@ -727,6 +743,9 @@ impl<'a> Model<'a> {
     /// up front, whose verify passes take up to `draft` tokens after the
     /// chosen one; with `draft` > 0, the MTP head follows it to draft tokens
     pub fn new_state(&self, context: usize, draft: usize) -> Result<State, Error> {
+        if self.inkling.is_some() {
+            return self.inkling_state(context, draft);
+        }
         let c = &self.cfg;
         let kv_dim = c.kv_dim();
         let kv = || -> Result<_, Error> {
@@ -878,6 +897,11 @@ impl<'a> Model<'a> {
                     (*conv, *s) = saved.swap_remove(n - 1);
                 }
                 saved.clear();
+            } else if let LayerState::Inkling { conv, saved, .. } = ls {
+                if n < verified {
+                    inkling::keep_conv(conv, saved, n, verified);
+                }
+                *saved = Vec::new();
             }
         }
         if let Some(m) = &mut state.mtp {
@@ -888,6 +912,9 @@ impl<'a> Model<'a> {
     }
 
     fn run(&self, state: &mut State, tokens: &[TokenId], pass: Pass) -> Vec<Vec<f32>> {
+        if let Some(ink) = &self.inkling {
+            return self.run_inkling(ink, state, tokens, pass);
+        }
         let c = &self.cfg;
         let n = tokens.len();
         let e = c.n_embd;
@@ -1392,6 +1419,14 @@ enum LayerState {
         s: Vec<f32>,
         saved: Vec<(Vec<f32>, Vec<f32>)>,
     },
+    /// a slot of `inkling2_loop`: its kv caches (`Attention` or `Window`),
+    /// and the conv state `[taps - 1][channels]`; `saved`: the conv inputs
+    /// of a verify pass, `[taps - 1 + n][channels]` (`inkling::short_conv`)
+    Inkling {
+        kv: Box<LayerState>,
+        conv: Vec<f32>,
+        saved: Vec<f32>,
+    },
 }
 
 /// The caches an attention layer reads and writes in a pass
@@ -1557,6 +1592,14 @@ impl State {
     pub fn memory(&self) -> SessionMemory {
         let mut m = SessionMemory::default();
         for ls in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.kv)) {
+            // a slot of `inkling2_loop`: its conv state, and its caches as a layer's
+            let ls = match ls {
+                LayerState::Inkling { kv, conv, .. } => {
+                    m.recurrent += 4 * conv.len();
+                    &**kv
+                }
+                ls => ls,
+            };
             match ls {
                 LayerState::Attention { k, v } => {
                     m.kv += 4 * (k.capacity() + v.capacity());
@@ -1565,6 +1608,7 @@ impl State {
                 // a fixed size, as a recurrent state
                 LayerState::Window { k, v, .. } => m.recurrent += 4 * (k.len() + v.len()),
                 LayerState::DeltaNet { conv, s, .. } => m.recurrent += 4 * (conv.len() + s.len()),
+                LayerState::Inkling { .. } => unreachable!("a slot in a slot"),
             }
         }
         if let Some(mtp) = &self.mtp {
@@ -1667,6 +1711,10 @@ enum LayerSnapshot {
         conv: Vec<f32>,
         s: Vec<f32>,
     },
+    Inkling {
+        kv: Box<LayerSnapshot>,
+        conv: Vec<f32>,
+    },
 }
 
 impl LayerSnapshot {
@@ -1676,6 +1724,7 @@ impl LayerSnapshot {
                 4 * (k.len() + v.len())
             }
             LayerSnapshot::DeltaNet { conv, s } => 4 * (conv.len() + s.len()),
+            LayerSnapshot::Inkling { kv, conv } => kv.bytes() + 4 * conv.len(),
         }
     }
 }
@@ -1732,6 +1781,10 @@ impl LayerState {
                 conv: copied(conv)?,
                 s: copied(s)?,
             },
+            LayerState::Inkling { kv, conv, .. } => LayerSnapshot::Inkling {
+                kv: Box::new(kv.snapshot(n_past, kv_dim, window)?),
+                conv: copied(conv)?,
+            },
         })
     }
 
@@ -1748,6 +1801,9 @@ impl LayerState {
             }
             (LayerState::DeltaNet { conv, s, .. }, LayerSnapshot::DeltaNet { conv: sc, s: ss }) => {
                 conv.len() == sc.len() && s.len() == ss.len()
+            }
+            (LayerState::Inkling { kv, conv, .. }, LayerSnapshot::Inkling { kv: sk, conv: sc }) => {
+                conv.len() == sc.len() && kv.fits(sk, n_past, kv_dim, window)
             }
             _ => false,
         }
@@ -1776,6 +1832,14 @@ impl LayerState {
             ) => {
                 conv.copy_from_slice(sc);
                 s.copy_from_slice(ss);
+                saved.clear();
+            }
+            (
+                LayerState::Inkling { kv, conv, saved },
+                LayerSnapshot::Inkling { kv: sk, conv: sc },
+            ) => {
+                kv.restore(sk, n_past, kv_dim);
+                conv.copy_from_slice(sc);
                 saved.clear();
             }
             _ => unreachable!("checked by fits"),

@@ -7,6 +7,7 @@
 pub mod rt;
 
 pub mod flint;
+pub mod inkling2;
 pub mod qwen35;
 pub mod qwen36;
 pub mod qwen38;
@@ -14,6 +15,7 @@ pub mod qwen38;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Template {
     Flint,
+    Inkling2,
     Qwen35,
     Qwen36,
     Qwen38,
@@ -26,7 +28,7 @@ pub struct Params<'a> {
     pub messages: &'a [rt::Message],
     /// the functions the model may call (all)
     pub tools: &'a [rt::Tool],
-    /// `add_generation_prompt` (all)
+    /// `add_generation_prompt` (flint, qwen35, qwen36, qwen38)
     pub add_generation_prompt: bool,
     /// `add_vision_id` (qwen35, qwen36, qwen38)
     pub add_vision_id: bool,
@@ -34,13 +36,14 @@ pub struct Params<'a> {
     pub enable_thinking: Option<bool>,
     /// `preserve_thinking`: `None` leaves it undefined (qwen36, qwen38)
     pub preserve_thinking: Option<bool>,
-    /// `reasoning_effort`: `None` leaves it undefined (qwen38)
+    /// `reasoning_effort`: `None` leaves it undefined (inkling2, qwen38)
     pub reasoning_effort: Option<&'a str>,
 }
 
 impl Template {
-    pub const ALL: [Template; 4] = [
+    pub const ALL: [Template; 5] = [
         Template::Flint,
+        Template::Inkling2,
         Template::Qwen35,
         Template::Qwen36,
         Template::Qwen38,
@@ -49,6 +52,7 @@ impl Template {
     pub fn name(self) -> &'static str {
         match self {
             Template::Flint => "flint",
+            Template::Inkling2 => "inkling2",
             Template::Qwen35 => "qwen35",
             Template::Qwen36 => "qwen36",
             Template::Qwen38 => "qwen38",
@@ -59,6 +63,7 @@ impl Template {
     pub fn hash(self) -> u64 {
         match self {
             Template::Flint => flint::TEMPLATE_HASH,
+            Template::Inkling2 => inkling2::TEMPLATE_HASH,
             Template::Qwen35 => qwen35::TEMPLATE_HASH,
             Template::Qwen36 => qwen36::TEMPLATE_HASH,
             Template::Qwen38 => qwen38::TEMPLATE_HASH,
@@ -75,6 +80,7 @@ impl Template {
     pub fn params(self) -> &'static [&'static str] {
         match self {
             Template::Flint => &["messages", "tools", "add_generation_prompt"],
+            Template::Inkling2 => &["messages", "tools", "reasoning_effort"],
             Template::Qwen35 => &[
                 "messages",
                 "tools",
@@ -108,6 +114,11 @@ impl Template {
                 messages: p.messages,
                 tools: p.tools,
                 add_generation_prompt: p.add_generation_prompt,
+            }),
+            Template::Inkling2 => inkling2::render(&inkling2::Params {
+                messages: p.messages,
+                tools: p.tools,
+                reasoning_effort: p.reasoning_effort,
             }),
             Template::Qwen35 => qwen35::render(&qwen35::Params {
                 messages: p.messages,

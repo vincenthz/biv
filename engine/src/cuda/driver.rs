@@ -447,7 +447,10 @@ impl Stream {
         let d = driver()?;
         d.bind();
         let mut s = core::ptr::null_mut();
-        d.check(unsafe { (d.api.stream_create)(&mut s, 0) }, "cuStreamCreate")?;
+        d.check(
+            unsafe { (d.api.stream_create)(&mut s, 0) },
+            "cuStreamCreate",
+        )?;
         Ok(Stream(s))
     }
 
@@ -485,7 +488,10 @@ impl Stream {
     /// a kernel that failed
     pub(crate) fn launch_and_wait(&self, g: &Graph) {
         let d = loaded();
-        d.must(unsafe { (d.api.graph_launch)(g.exec, self.0) }, "cuGraphLaunch");
+        d.must(
+            unsafe { (d.api.graph_launch)(g.exec, self.0) },
+            "cuGraphLaunch",
+        );
         d.must(unsafe { (d.api.stream_synchronize)(self.0) }, "a kernel");
     }
 }
@@ -511,7 +517,10 @@ impl Event {
     /// Mark the work queued so far on the current stream
     pub(crate) fn record(&self) {
         let d = loaded();
-        d.must(unsafe { (d.api.event_record)(self.0, current_stream()) }, "cuEventRecord");
+        d.must(
+            unsafe { (d.api.event_record)(self.0, current_stream()) },
+            "cuEventRecord",
+        );
     }
 
     /// Make the current stream's next work wait for the last mark
@@ -753,7 +762,9 @@ impl Buf {
         assert!(self.is_host() && bytes <= self.bytes);
         let d = loaded();
         d.must(
-            unsafe { (d.api.memcpy_htod_async)(dst, self.host.cast_const(), bytes, current_stream()) },
+            unsafe {
+                (d.api.memcpy_htod_async)(dst, self.host.cast_const(), bytes, current_stream())
+            },
             "cuMemcpyHtoDAsync",
         );
     }

@@ -1,4 +1,4 @@
-//! Interactive chat with a Qwen 3.5 family or Flint GGUF model.
+//! Interactive chat with a Qwen 3.5 family, Flint or Inkling-2 GGUF model.
 
 use std::error::Error;
 use std::io::{BufRead, IsTerminal, Write};
@@ -26,9 +26,12 @@ usage: biv [options]
                             names it [default: hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_1]
   -p, --prompt <text>       answer one message and exit
   -s, --system <text>       system prompt
-      --no-think            disable the reasoning block (Flint decides by itself)
-      --effort <level>      reasoning effort: low, medium, xhigh [default: xhigh]
-                            (Qwen only)
+      --no-think            disable the reasoning block (Flint decides by itself;
+                            Inkling-2 gets the effort none, and still reasons
+                            briefly)
+      --effort <level>      reasoning effort: low, medium, high, xhigh
+                            [default: xhigh] (Qwen, where high is xhigh;
+                            Inkling-2)
       --builtin-format      render prompts with biv's built-in formats, even
                             when the model's chat template is a compiled one
   -c, --ctx <n>             context size in tokens [default: 16384]
@@ -266,8 +269,17 @@ fn make_engine<'m>(
     let batch = opts.batch.unwrap_or(512);
     #[cfg(target_os = "macos")]
     {
-        let _ = gguf;
-        Ok(Box::new(biv::metal::MetalEngine::new(model, batch)?))
+        use biv::memory::{Backend, Footprint};
+        match biv::metal::MetalEngine::new(model, batch) {
+            Ok(engine) => Ok(Box::new(engine)),
+            // a geometry the kernels don't take: the cpu runs the model
+            Err(e)
+                if !Footprint::from_gguf(gguf)?.supports(Backend::Metal { max_batch: batch }) =>
+            {
+                Err(format!("{e} (use --cpu)").into())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
     #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
     {
@@ -276,8 +288,16 @@ fn make_engine<'m>(
         use biv::memory::{Backend, Footprint};
         let context = opts.context.min(model.cfg.context_length);
         let draft = opts.draft.unwrap_or(0).max(opts.lookup);
-        let session =
-            Footprint::from_gguf(gguf)?.session(Backend::Cuda { max_batch: batch }, context, draft);
+        let footprint = Footprint::from_gguf(gguf)?;
+        let backend = Backend::Cuda { max_batch: batch };
+        // no estimate of a session the engine doesn't run
+        if !footprint.supports(backend) {
+            let arch = model.cfg.arch.name();
+            return Err(
+                format!("cuda: {arch} is not supported on this backend yet (use --cpu)").into(),
+            );
+        }
+        let session = footprint.session(backend, context, draft);
         Ok(Box::new(biv::cuda::CudaEngine::with_reserve(
             model,
             batch,
@@ -430,6 +450,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             "note: this model decides by itself whether and how long to think: --no-think and --effort have no effect"
         );
     }
+    if chat.thinking_per_conversation() && !chat.opts.thinking {
+        eprintln!(
+            "note: --no-think gives this model its lowest effort; it still reasons briefly first, shown as reasoning"
+        );
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -538,7 +563,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             "/think" | "/nothink" => {
                 chat.opts.thinking = msg == "/think";
-                eprintln!("thinking {}", if chat.opts.thinking { "on" } else { "off" });
+                let on = if chat.opts.thinking { "on" } else { "off" };
+                if chat.thinking_per_conversation() && chat.n_past() > 0 {
+                    eprintln!(
+                        "thinking {on} from the next conversation (/reset): this model is told at its start"
+                    )
+                } else {
+                    eprintln!("thinking {on}");
+                }
             }
             "/stats" => print_memory(&chat, engine.as_ref()),
             _ if msg.starts_with('/') => eprintln!("unknown command {msg}"),

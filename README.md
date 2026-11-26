@@ -18,6 +18,7 @@ Models architecture supported:
 * qwen35 (supported Qwen3.8-27B, Qwen3.5-4B)
 * qwen35moe (supported Qwen3.6-35B-A3B)
 * flint
+* inkling2_loop (supported Inkling-2-Mini; Metal and CPU only)
 
 Note: It might support other models that use those model architectures.
 
@@ -80,7 +81,8 @@ pinned host memory that the GPU reads across the bus, so models larger than
 the GPU run, at the speed of the bus for that part. The token embeddings stay
 on the host. KV caches are f16, as on Metal.
 
-Not yet on CUDA: drafting with the MTP head (`--draft` gives the room to
+Not yet on CUDA: the `inkling2_loop` architecture (Inkling-2 runs on Metal and
+the CPU, `--cpu`), drafting with the MTP head (`--draft` gives the room to
 verify, `--lookup` works), sequences batched in one pass (they run one after
 another), and tuned kernels: decode reads the weights at about half the
 memory bandwidth, prefill uses no tensor cores. On an RTX 5080 (16 GB, PCIe 5),
@@ -152,6 +154,30 @@ reason before answering: `--no-think`, `/nothink` and `--effort` have no effect.
 Its GGUF has no MTP head. Its tokenizer follows Hugging Face `tokenizers`,
 whose pre-tokenizer splits words on case changes (`parseHttp` is `parse`,
 `Http`); llama.cpp's matcher doesn't, so its token ids differ on such words.
+
+[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+(`inkling2_loop`: 24 layers, the middle 12 run three times; 128 experts with
+sigmoid routing, 8 per token; sliding window attention over 1024 positions,
+full attention every sixth layer, no rope; Metal and the CPU, not yet CUDA):
+
+```sh
+hf download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-Q8_0.gguf   # 27.8 GB
+./target/release/biv -m hf.co/ggml-org/Inkling-2-Mini-GGUF:Q8_0
+```
+
+Its chat is made of blocks (`<|message_model|><|content_thinking|>…<|end_message|>`,
+then text, or function calls as JSON), and its reasoning is set by an effort
+level written once, before the first message: `--effort low`, `medium`,
+`high` and `xhigh` are its 0.2, 0.7, 0.9 (its own default) and 0.99 (biv's
+default), and `--no-think`
+is `none`, 0, which, its model card says, does not fully disable reasoning:
+it still starts its answers with a short reasoning block (llama.cpp's greedy
+output on the same prompt has one too), which biv shows as reasoning, dimmed in
+a terminal. As the level starts the conversation, `/think` and `/nothink` apply
+from the next one (`/reset`). Its GGUF has no MTP head. Its tokenizer is o200k's (GPT-4o's), with
+`ignore_merges`, following Hugging Face `tokenizers` too: llama.cpp's matcher
+differs on words where a non-ASCII upper case letter meets a letter of the
+other case, and on `'ſ`.
 
 Decoding is speculative by default: the model's MTP head drafts the next tokens
 (4 on Metal, 1 on the CPU), and the trunk checks them in the same pass as the
@@ -277,17 +303,20 @@ time either way (cpuid). Its features:
 | `engine/src/par.rs` | rayon's parallel iterators, or sequential ones of the same names |
 | `engine/src/math.rs` | libm float functions without `std` |
 | `engine/src/model.rs` | the `qwen35` / `qwen35moe` / `flint` graphs: port of llama.cpp `src/models/qwen35.cpp`, `qwen35moe.cpp`, `delta-net-base.cpp` and `flint.cpp`; expert routing; sliding windows; MTP drafting |
+| `engine/src/model/inkling.rs` | the `inkling2_loop` graph: port of llama.cpp `src/models/inkling2.cpp` and `inkling2-loop.cpp`; depth mixes over the blocks, the looped core's controllers, short convs, relative position attention, SITU experts |
+| `engine/src/model/inkling/cpu.rs` | its CPU passes: tiled matmuls, the threads kept busy between the parallel loops of short passes |
 | `engine/src/memory.rs` | memory of a model and its sessions: estimated from the GGUF alone (`Footprint`), or reported by engines and sessions |
 | `engine/src/engine.rs` | `Engine` / `Session` / `Batch` traits shared by the backends (draft / verify / keep for speculative decoding); CPU implementation; sequential batches |
 | `engine/src/batch.rs` | continuous batching: the scheduler, and the `Engine` handle whose sessions it serves |
 | `engine/src/metal/mod.rs` | Metal backend: no-copy weight buffers, per-sequence KV/recurrent state, one command buffer per forward pass of one or more sequences, on a concurrent encoder |
 | `engine/src/metal/kernels.metal` | matvec / simdgroup matmul for each quant type (from ggml-metal), fused norm, rope, split-K (decode) and flash (prefill) attention, conv and gated delta-net kernels, expert routing and sorting, the matmul / matvec over each expert's tokens, and the matvec per (token, expert) pair of decode steps |
+| `engine/src/metal/inkling.rs`, `inkling.metal` | `inkling2_loop` on Metal: its passes, slots and kernels (depth mix, controllers, convs, split-K and flash attention with relative positions, fused q8_0 expert matvecs) |
 | `engine/src/cuda/mod.rs` | CUDA backend: weight placement (device, then mapped host memory), per-sequence KV/recurrent state, the kernel launches of a forward pass |
 | `engine/src/cuda/kernels.cu` | matvec / matmul per quant type (32-value units dequantized per lane), the same over each expert's pairs, norm, rope + cache write, attention (online softmax, sinks, rings), conv and gated delta-net, expert routing, sorting and combining |
 | `engine/src/cuda/driver.rs` | the CUDA driver API, loaded at run time; device and mapped host buffers |
 | `engine/build.rs` | with `cuda`: the kernels compiled by cudaforge / nvcc to PTX, assembled by ptxas |
-| `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35` and `flint` pre-tokenizer regexes, matched by hand |
-| `engine/src/chat.rs` | chat templates (ChatML with `<think>`, Flint's role tokens), incremental multi-turn state, the speculative decoding loop |
+| `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35`, `flint` and `inkling2` (o200k) pre-tokenizer regexes, matched by hand |
+| `engine/src/chat.rs` | chat templates (ChatML with `<think>`, Flint's role tokens, Inkling-2's blocks), incremental multi-turn state, the speculative decoding loop |
 | `engine/src/transcript.rs` | a conversation as token ids, and its bytes |
 | `engine/src/sampler.rs` | temperature / top-k / top-p / min-p / penalties |
 | `src/lib.rs` | GGUF files: shard discovery, mmap |
@@ -481,6 +510,23 @@ chats, `ChatOptions::draft` at 0 or 1 is faster.
   then split flash attention past 2k positions) have the same top-1 token; over
   4000 tokens they differ by at most 0.06, and by 0.1–0.3 in the next decode
   steps.
+- `examples/passes.rs <gguf> [--cpu] [n_tokens] [batch]`: the logits don't
+  depend on how the tokens are split into passes, beyond rounding: passes of
+  256, 64, 31, 7 and 1 tokens, verify + keep against decode steps, a snapshot
+  restored into another session, two sequences in one batch against each
+  alone. Inkling-2-Mini on Metal: the same top-1 token at every compared
+  position, max differences of 1–3.4 (6.8 in the decode steps of a batch of
+  2: each pass size runs other kernels, and a near tie picks other experts),
+  a restored snapshot exact.
+- `examples/reflogits.rs <gguf> <ref> [--mode M] [--metal]`: logits against
+  reference logits of the same token ids (llama.cpp's `llama-results`,
+  converted to raw files), per position and in distribution: top-1 agreement,
+  max difference, KL. Inkling-2-Mini against llama.cpp's CPU on 396 and 1852
+  tokens: top-1 97.3–97.7% and KL 4.7e-3–7.8e-3 on the CPU, 96.0–97.7% and
+  5.3e-3–6.1e-3 on Metal, where llama.cpp against itself with another batch
+  size gives 97.4–97.7% and 4.5e-3–5.3e-3.
+- `examples/inkperf.rs <gguf> [--cpu] [-c N] [-n M]`: prefill and decode
+  rates at a context.
 
 ## Performance (M2 Max 38-core GPU, Q4_1)
 

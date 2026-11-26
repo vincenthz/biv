@@ -306,9 +306,34 @@ fn record(f: &mut Fingerprint, key: &str, logits: &[f32]) {
     f.push(format!("{key}.top"), joined(top));
 }
 
-/// [`PROBE_PROMPT`] in the model's chat format: ChatML, or Flint's role tokens
+/// [`PROBE_PROMPT`] in the model's chat format: ChatML, Flint's role tokens,
+/// or Inkling-2's blocks (the effort level 0, then the answer's text block
+/// opened)
 fn probe_prompt(tok: &Tokenizer) -> String {
-    if tok.token_id("<|im_start|>").is_some() || tok.token_id("<|assistant|>").is_none() {
+    let has = |t: &str| tok.token_id(t).is_some();
+    probe_prompt_for(
+        has("<|im_start|>"),
+        has("<|assistant|>"),
+        has("<|message_model|>"),
+    )
+}
+
+/// [`probe_prompt`] for a vocabulary with those tokens or not
+fn probe_prompt_for(im_start: bool, assistant: bool, message_model: bool) -> String {
+    if !im_start && message_model {
+        return PROBE_PROMPT
+            .replace("<|im_start|>system\n", "<|message_system|><|content_text|>")
+            .replace(
+                "<|im_end|>\n<|im_start|>user\n",
+                "<|end_message|><|message_system|><|content_text|>Thinking effort level: 0\
+                 <|end_message|><|message_user|><|content_text|>",
+            )
+            .replace(
+                "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                "<|end_message|><|message_model|><|content_text|>",
+            );
+    }
+    if im_start || !assistant {
         return PROBE_PROMPT.into();
     }
     PROBE_PROMPT
@@ -722,5 +747,57 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("chat text: same"), "{text}");
+    }
+
+    /// Inkling-2's probe is its template's render of the probe's messages,
+    /// thinking off, then the answer's text block opened; the others' are
+    /// as they were
+    #[test]
+    fn inkling_probe_prompt_is_the_template_render() {
+        use std::io::Read;
+        assert_eq!(probe_prompt_for(true, false, false), PROBE_PROMPT, "ChatML");
+        let Some(path) = std::env::var_os("HOME")
+            .map(|h| {
+                Path::new(&h)
+                    .join(".cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots")
+            })
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .and_then(|d| {
+                d.flatten()
+                    .map(|e| e.path().join("Inkling-2-Mini-Q8_0.gguf"))
+                    .find(|p| p.exists())
+            })
+        else {
+            eprintln!("no Inkling-2-Mini GGUF: skipped");
+            return;
+        };
+        let mut head = Vec::new();
+        std::fs::File::open(path)
+            .unwrap()
+            .take(32 << 20)
+            .read_to_end(&mut head)
+            .unwrap();
+        let tok = Tokenizer::from_gguf_bytes(&head).unwrap();
+        let user = PROBE_PROMPT
+            .split_once("<|im_start|>user\n")
+            .and_then(|(_, u)| u.split_once("<|im_end|>"))
+            .unwrap()
+            .0;
+        let messages = [
+            biv::template::rt::Message::new(biv::template::rt::Role::System, PROBE_SYSTEM),
+            biv::template::rt::Message::new(biv::template::rt::Role::User, user),
+        ];
+        let rendered = biv::template::Template::Inkling2
+            .render(&biv::template::Params {
+                messages: &messages,
+                reasoning_effort: Some("none"),
+                ..Default::default()
+            })
+            .unwrap()
+            .text();
+        assert_eq!(
+            probe_prompt(&tok),
+            rendered + "<|message_model|><|content_text|>"
+        );
     }
 }

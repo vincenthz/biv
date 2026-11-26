@@ -1,10 +1,11 @@
 //! Multi-turn chat on top of the model, following the GGUF's chat template.
 //! When it is one of the templates compiled into [`crate::template`], found by
 //! the hash of its text, that code renders the prompts. Otherwise built-in
-//! formats do: ChatML with `<think>` reasoning blocks (Qwen), or Flint's role
-//! tokens (`<|user|>`, `<|assistant|>`, …), told apart by the vocabulary. The
-//! format, from the vocabulary either way, is what reads the answers: the
-//! reasoning blocks, the function calls, the end of an answer.
+//! formats do: ChatML with `<think>` reasoning blocks (Qwen), Flint's role
+//! tokens (`<|user|>`, `<|assistant|>`, …), or Inkling-2's blocks
+//! (`<|message_model|><|content_text|>…<|end_message|>`), told apart by the
+//! vocabulary. The format, from the vocabulary either way, is what reads the
+//! answers: the reasoning blocks, the function calls, the end of an answer.
 //!
 //! Every turn only appends to the sequence: the model state is kept between
 //! turns and only the new tokens are processed. This suits the recurrent
@@ -59,6 +60,291 @@ enum Format {
     /// `<|role|>...` with no end tokens: the next role's token ends an answer.
     /// The model opens its reasoning block itself, when it wants to.
     Flint { think: TokenId },
+    /// Inkling-2's blocks, see [`Inkling`]
+    Inkling(Inkling),
+}
+
+/// Inkling-2's tokens. A message is blocks, each a role's header, a content
+/// type and the content up to `<|end_message|>`; an answer is the model's
+/// blocks (reasoning, text, function calls), the model writing their headers,
+/// then `<|content_model_end_sampling|>`. There is no generation prompt, and
+/// the reasoning is switched by an effort level written once, before the first
+/// message: `0` for none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Inkling {
+    /// the headers: the model's, the others'
+    model: TokenId,
+    user: TokenId,
+    system: TokenId,
+    tool: TokenId,
+    /// the content types
+    text: TokenId,
+    thinking: TokenId,
+    /// `{"name": NAME, "args": {…}}`, after a header with the name, or not
+    call: TokenId,
+    /// a function's error and a call as text, which only show as text
+    error: Option<TokenId>,
+    call_text: Option<TokenId>,
+    /// `<|end_message|>`, which ends every block
+    end: TokenId,
+    /// `<|content_model_end_sampling|>`, the end of an answer
+    end_sampling: TokenId,
+}
+
+/// Where an Inkling answer is, between its tokens
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Block {
+    Between,
+    /// after a header, the text before the content type: a function's name
+    Header(String),
+    Thinking,
+    Text,
+    /// a function call's JSON so far, after the header's text
+    Call {
+        name: String,
+        json: String,
+    },
+    /// content that is not shown (an image's, a declaration's)
+    Hidden,
+}
+
+/// Reads an Inkling answer token by token into [`Event`]s: the blocks as the
+/// reference's parsers take them, the header and its name optional, text not
+/// trimmed, a function's name from its JSON, else from the header
+struct InklingReader {
+    f: Inkling,
+    block: Block,
+    decoder: StreamDecoder,
+    /// as in [`Chat::answer`]: the answer doesn't start with newlines, nor do
+    /// they show at its end
+    skip_leading_newlines: bool,
+    held_newlines: String,
+}
+
+impl InklingReader {
+    fn new(f: Inkling) -> Self {
+        InklingReader {
+            f,
+            block: Block::Between,
+            decoder: StreamDecoder::default(),
+            skip_leading_newlines: true,
+            held_newlines: String::new(),
+        }
+    }
+
+    /// Whether `token`, which the model wrote, ends the answer: another role's
+    /// header, which only the next turn writes
+    fn ends(&self, token: TokenId) -> bool {
+        token == self.f.user || token == self.f.system || token == self.f.tool
+    }
+
+    /// The end of the block, if one is open
+    fn finish(&mut self, calls: &mut Vec<ToolCall>, on_event: &mut dyn FnMut(Event<'_>)) {
+        self.decoder = StreamDecoder::default();
+        match core::mem::replace(&mut self.block, Block::Between) {
+            Block::Thinking => {
+                self.held_newlines.clear();
+                self.skip_leading_newlines = true;
+                on_event(Event::ThinkingDone);
+            }
+            Block::Call { name, json } => match ToolCall::parse_inkling(&name, &json) {
+                Some(c) => {
+                    on_event(Event::ToolCall(&c));
+                    calls.push(c);
+                }
+                // not a call after all: show it as it was written
+                None => on_event(Event::Answer(&json)),
+            },
+            _ => {}
+        }
+    }
+
+    /// Read `token`, which neither ends the answer nor the block
+    fn token(
+        &mut self,
+        token: TokenId,
+        tok: &Tokenizer,
+        calls: &mut Vec<ToolCall>,
+        on_event: &mut dyn FnMut(Event<'_>),
+    ) {
+        let f = self.f;
+        if token == f.end {
+            self.finish(calls, on_event);
+        } else if token == f.model {
+            // a header before the block's end ends it too
+            self.finish(calls, on_event);
+            self.block = Block::Header(String::new());
+        } else if token == f.thinking
+            || token == f.text
+            || token == f.call
+            || Some(token) == f.error
+            || Some(token) == f.call_text
+        {
+            // the header is optional
+            let name = match core::mem::replace(&mut self.block, Block::Between) {
+                Block::Header(name) => name,
+                open => {
+                    self.block = open;
+                    self.finish(calls, on_event);
+                    String::new()
+                }
+            };
+            self.block = if token == f.thinking {
+                self.held_newlines.clear();
+                self.skip_leading_newlines = true;
+                Block::Thinking
+            } else if token == f.call {
+                Block::Call {
+                    name,
+                    json: String::new(),
+                }
+            } else {
+                Block::Text
+            };
+        } else if tok.is_special(token) {
+            // another content type, or a token of no block
+            if let Block::Between | Block::Header(_) = self.block {
+                self.block = Block::Hidden;
+            }
+        } else {
+            let mut text = self.decoder.push(tok.token_bytes(token));
+            let thinking = match &mut self.block {
+                Block::Header(s) | Block::Call { json: s, .. } => {
+                    s.push_str(&text);
+                    return;
+                }
+                Block::Hidden => return,
+                Block::Thinking => true,
+                // text outside any block shows too
+                Block::Text | Block::Between => false,
+            };
+            if self.skip_leading_newlines {
+                let trimmed = text.trim_start_matches('\n');
+                if !trimmed.is_empty() {
+                    self.skip_leading_newlines = false;
+                }
+                text = trimmed.to_string();
+            }
+            let body = text.trim_end_matches('\n');
+            if !body.is_empty() {
+                let shown = core::mem::take(&mut self.held_newlines) + body;
+                on_event(if thinking {
+                    Event::Thinking(&shown)
+                } else {
+                    Event::Answer(&shown)
+                });
+            }
+            self.held_newlines.push_str(&text[body.len()..]);
+        }
+    }
+
+    /// At the end of the answer, however it ends: the end of the open block,
+    /// and the tokens that close the answer in the history, as the template
+    /// writes it (`…<|end_message|><|content_model_end_sampling|>`)
+    fn close(
+        &mut self,
+        calls: &mut Vec<ToolCall>,
+        on_event: &mut dyn FnMut(Event<'_>),
+    ) -> Vec<TokenId> {
+        let mut closing = Vec::with_capacity(2);
+        if self.block != Block::Between {
+            closing.push(self.f.end);
+        }
+        self.finish(calls, on_event);
+        closing.push(self.f.end_sampling);
+        closing
+    }
+}
+
+/// The members of the JSON object `text`, which is valid JSON: the text of
+/// each key (quoted) and value, as written
+fn json_members(text: &str) -> Vec<(&str, &str)> {
+    let b = text.as_bytes();
+    let ws = |mut i: usize| {
+        while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        i
+    };
+    let string_end = |mut i: usize| {
+        i += 1;
+        while i < b.len() && b[i] != b'"' {
+            i += if b[i] == b'\\' { 2 } else { 1 };
+        }
+        (i + 1).min(b.len())
+    };
+    // a value ends at a ',' or the '}' of its object
+    let value_end = |mut i: usize| {
+        let mut depth = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'"' => {
+                    i = string_end(i);
+                    continue;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' | b',' if depth == 0 => break,
+                b'}' | b']' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        i
+    };
+    let mut members = Vec::new();
+    // past the '{'
+    let mut i = ws(0) + 1;
+    loop {
+        i = ws(i);
+        if b.get(i) != Some(&b'"') {
+            return members;
+        }
+        let key_end = string_end(i);
+        let key = &text[i..key_end];
+        // past the ':'
+        let start = ws(ws(key_end) + 1);
+        let end = value_end(start);
+        members.push((key, text[start..end].trim_end()));
+        i = ws(end);
+        if b.get(i) != Some(&b',') {
+            return members;
+        }
+        i += 1;
+    }
+}
+
+/// The value of `key` in the members of a JSON object, the last one when it
+/// has several (as [`rt::Json::parse`])
+fn json_member<'t>(members: &[(&str, &'t str)], key: &str) -> Option<&'t str> {
+    let named = |k: &str| matches!(rt::Json::parse(k), Ok(rt::Json::Str(k)) if k == key);
+    members
+        .iter()
+        .rev()
+        .find(|(k, _)| named(k))
+        .map(|&(_, v)| v)
+}
+
+/// JSON text without the whitespace between its tokens, as the Inkling
+/// template writes a function's arguments
+fn json_compact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut string, mut escaped) = (false, false);
+    for c in text.chars() {
+        if string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => string = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            string = true;
+        } else if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Message text as the Flint template writes it: its `flint_text` macro
@@ -145,6 +431,9 @@ fn tool_function(tool: &str) -> &str {
 pub enum ReasoningEffort {
     Low,
     Medium,
+    /// Inkling-2's 0.9, its default; for Qwen the same as `XHigh`, as its
+    /// templates have it
+    High,
     XHigh,
 }
 
@@ -153,7 +442,8 @@ impl ReasoningEffort {
         Some(match s {
             "low" => Self::Low,
             "medium" => Self::Medium,
-            "high" | "xhigh" => Self::XHigh,
+            "high" => Self::High,
+            "xhigh" => Self::XHigh,
             _ => return None,
         })
     }
@@ -163,6 +453,7 @@ impl ReasoningEffort {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
+            Self::High => "high",
             Self::XHigh => "xhigh",
         }
     }
@@ -170,7 +461,7 @@ impl ReasoningEffort {
     /// The system instruction the template adds when thinking is enabled
     fn instructions(self) -> Option<&'static str> {
         match self {
-            Self::XHigh => Some(
+            Self::High | Self::XHigh => Some(
                 "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
             ),
             Self::Low => Some(
@@ -256,7 +547,47 @@ impl ToolCall {
         match format {
             Format::ChatMl { .. } => Self::parse(text),
             Format::Flint { .. } => Self::parse_flint(text),
+            Format::Inkling(_) => Self::parse_inkling("", text),
         }
+    }
+
+    /// Inkling's: `{"name": NAME, "args": {KEY: VALUE, …}}`, after a header
+    /// whose text is the name too, or nothing. The JSON's name is the one;
+    /// the arguments that are not strings are their JSON as the model wrote
+    /// it (numbers as written), without the whitespace between its tokens.
+    fn parse_inkling(header: &str, json: &str) -> Option<Self> {
+        let json = json.trim();
+        let j = rt::Json::parse(json).ok()?;
+        let rt::Json::Object(_) = j else {
+            return None;
+        };
+        let name = match j.get("name") {
+            Some(n) => n.as_str()?.trim(),
+            None => header.trim(),
+        };
+        if name.is_empty() {
+            return None;
+        }
+        let arguments = match j.get("args") {
+            None | Some(rt::Json::Null) => Vec::new(),
+            Some(rt::Json::Object(args)) => {
+                let text = json_members(json_member(&json_members(json), "args")?);
+                args.iter()
+                    .map(|(k, v)| {
+                        let v = match v {
+                            rt::Json::Str(s) => s.clone(),
+                            _ => json_compact(json_member(&text, k)?),
+                        };
+                        Some((k.clone(), v))
+                    })
+                    .collect::<Option<_>>()?
+            }
+            Some(_) => return None,
+        };
+        Some(ToolCall {
+            name: name.to_string(),
+            arguments,
+        })
     }
 
     /// From the text between `<tool_call>` and `</tool_call>`:
@@ -342,6 +673,7 @@ pub struct Prefix {
     pending: Vec<TokenId>,
     generated: Vec<TokenId>,
     history: Vec<TokenId>,
+    calls: Vec<String>,
 }
 
 impl Prefix {
@@ -380,9 +712,13 @@ pub struct Chat<'m> {
     format: Format,
     /// the compiled chat template that renders the prompts, if any
     template: Option<compiled::Template>,
-    think_end: TokenId,
-    tool_call: TokenId,
-    tool_call_end: TokenId,
+    /// ChatML's and Flint's reasoning end and call tokens, not Inkling's
+    think_end: Option<TokenId>,
+    tool_call: Option<TokenId>,
+    tool_call_end: Option<TokenId>,
+    /// the names of the last answer's function calls, which the results
+    /// sent back are named by
+    calls: Vec<String>,
 }
 
 /// Stand-ins for the messages before a turn, see [`Chat::template_turn`]:
@@ -460,6 +796,20 @@ impl<'m> Chat<'m> {
             Format::Flint {
                 think: id("<think>")?,
             }
+        } else if !has("<|im_start|>") && has("<|message_model|>") && has("<|end_message|>") {
+            Format::Inkling(Inkling {
+                model: id("<|message_model|>")?,
+                user: id("<|message_user|>")?,
+                system: id("<|message_system|>")?,
+                tool: id("<|message_tool|>")?,
+                text: id("<|content_text|>")?,
+                thinking: id("<|content_thinking|>")?,
+                call: id("<|content_invoke_tool_json|>")?,
+                error: tok.token_id("<|content_tool_error|>"),
+                call_text: tok.token_id("<|content_invoke_tool_text|>"),
+                end: id("<|end_message|>")?,
+                end_sampling: id("<|content_model_end_sampling|>")?,
+            })
         } else {
             id("<|im_start|>")?;
             Format::ChatMl {
@@ -471,10 +821,19 @@ impl<'m> Chat<'m> {
         } else {
             tok.chat_template().and_then(compiled::Template::recognize)
         };
+        let session = engine.new_session(opts.context, session_draft(engine, &opts))?;
+        let (think_end, tool_call, tool_call_end) = match format {
+            Format::Inkling(_) => (None, None, None),
+            _ => (
+                Some(id("</think>")?),
+                Some(id("<tool_call>")?),
+                Some(id("</tool_call>")?),
+            ),
+        };
         Ok(Chat {
             engine,
             tok,
-            session: engine.new_session(opts.context, session_draft(engine, &opts))?,
+            session,
             opts,
             pending: Vec::new(),
             generated: Vec::new(),
@@ -482,9 +841,10 @@ impl<'m> Chat<'m> {
             lookup_run: 0,
             format,
             template,
-            think_end: id("</think>")?,
-            tool_call: id("<tool_call>")?,
-            tool_call_end: id("</tool_call>")?,
+            think_end,
+            tool_call,
+            tool_call_end,
+            calls: Vec::new(),
         })
     }
 
@@ -498,6 +858,7 @@ impl<'m> Chat<'m> {
         self.generated.clear();
         self.history.clear();
         self.lookup_run = 0;
+        self.calls.clear();
         Ok(())
     }
 
@@ -515,7 +876,15 @@ impl<'m> Chat<'m> {
     /// Whether [`ChatOptions::thinking`] and [`ChatOptions::effort`] have an
     /// effect: Flint decides by itself when to reason, and how much
     pub fn controls_thinking(&self) -> bool {
-        matches!(self.format, Format::ChatMl { .. })
+        matches!(self.format, Format::ChatMl { .. } | Format::Inkling(_))
+    }
+
+    /// Whether [`ChatOptions::thinking`] and [`ChatOptions::effort`] are
+    /// taken at the start of a conversation only, not per message: Inkling-2
+    /// is told the effort once, before the first message (thinking off is
+    /// the effort `none`), so changing them takes a new conversation
+    pub fn thinking_per_conversation(&self) -> bool {
+        matches!(self.format, Format::Inkling(_))
     }
 
     /// The memory of the conversation's session
@@ -534,9 +903,10 @@ impl<'m> Chat<'m> {
     /// is processed now, so that the prefix holds it.
     pub fn save(&mut self) -> Result<Prefix, Error> {
         if self.session.n_past() == 0 {
-            let system = match self.template {
-                Some(t) => self.opening(t)?,
-                None => {
+            let system = match (self.template, self.format) {
+                (Some(t), _) => self.opening(t)?,
+                (None, Format::Inkling(_)) => self.inkling_system()?,
+                (None, _) => {
                     let mut parts = Vec::new();
                     let prompt = self.system_prompt();
                     self.system_block(prompt.as_deref(), &mut parts);
@@ -558,6 +928,7 @@ impl<'m> Chat<'m> {
             pending: self.pending.clone(),
             generated: self.generated.clone(),
             history: self.history.clone(),
+            calls: self.calls.clone(),
         })
     }
 
@@ -569,6 +940,7 @@ impl<'m> Chat<'m> {
         self.pending.clone_from(&prefix.pending);
         self.generated.clone_from(&prefix.generated);
         self.history.clone_from(&prefix.history);
+        self.calls.clone_from(&prefix.calls);
         self.lookup_run = 0;
         Ok(())
     }
@@ -636,6 +1008,8 @@ impl<'m> Chat<'m> {
         self.pending = rest.to_vec();
         self.generated.clone_from(generated);
         self.lookup_run = 0;
+        // not in a transcript: the results of its last calls go unnamed
+        self.calls.clear();
         Ok(())
     }
 
@@ -670,7 +1044,12 @@ impl<'m> Chat<'m> {
             enable_thinking: Some(self.opts.thinking),
             // the history keeps past reasoning, see the module
             preserve_thinking: Some(true),
-            reasoning_effort: Some(self.opts.effort.as_str()),
+            // Inkling-2's template has no switch but the effort: none is
+            // thinking off, as llama.cpp has it
+            reasoning_effort: Some(match self.format {
+                Format::Inkling(_) if !self.opts.thinking => "none",
+                _ => self.opts.effort.as_str(),
+            }),
             add_vision_id: false,
         }
     }
@@ -712,10 +1091,17 @@ impl<'m> Chat<'m> {
         };
         let (mut a, b) = (first(STAND_IN_QUERY)?, first(STAND_IN_ANSWER)?);
         let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-        let cut = a[..common]
+        let mut cut = a[..common]
             .iter()
             .rposition(|&id| self.tok.is_special(id))
             .unwrap_or(0);
+        // Inkling's message starts with two: `<|message_user|><|content_text|>`
+        if let Format::Inkling(f) = self.format
+            && cut > 0
+            && a[cut - 1] == f.user
+        {
+            cut -= 1;
+        }
         a.truncate(cut);
         Ok(a)
     }
@@ -757,7 +1143,19 @@ impl<'m> Chat<'m> {
             return Err(Error::Template("an answer's text is not written".into()));
         };
         let tokens = self.encode(&rest);
-        let k = overlap(&self.pending, &tokens);
+        let k = match self.format {
+            // the template's end of the answer is its last block's end, then
+            // the end of sampling, which ends what the answer left
+            // ([`InklingReader::close`]) however it ended: in a block, after
+            // one, after text outside any
+            Format::Inkling(f) => match tokens.iter().position(|&t| t == f.end_sampling) {
+                Some(i) => i + 1,
+                None => {
+                    return Err(Error::Template("an answer's end is not written".into()));
+                }
+            },
+            _ => overlap(&self.pending, &tokens),
+        };
         let mut out = self.pending.clone();
         out.extend_from_slice(&tokens[k..]);
         Ok(out)
@@ -769,8 +1167,103 @@ impl<'m> Chat<'m> {
         let system = match self.format {
             Format::ChatMl { .. } => Cow::Borrowed(system.trim()),
             Format::Flint { .. } => flint_text(system),
+            // as it is, unless blank
+            Format::Inkling(_) if system.trim().is_empty() => return None,
+            Format::Inkling(_) => Cow::Borrowed(system),
         };
         (!system.is_empty()).then_some(system)
+    }
+
+    /// Inkling's effort level, as its template writes the levels'
+    fn inkling_effort(&self) -> &'static str {
+        if !self.opts.thinking {
+            return "0";
+        }
+        match self.opts.effort {
+            ReasoningEffort::Low => "0.2",
+            ReasoningEffort::Medium => "0.7",
+            ReasoningEffort::High => "0.9",
+            ReasoningEffort::XHigh => "0.99",
+        }
+    }
+
+    /// Inkling's system blocks, as its template writes them before the first
+    /// message: the tools (as JSON, compact, the keys sorted), the system
+    /// prompt, the effort level
+    fn inkling_system(&self) -> Result<Vec<TokenId>, Error> {
+        let mut tools = None;
+        if !self.opts.tools.is_empty() {
+            let specs = self
+                .opts
+                .tools
+                .iter()
+                .map(|t| {
+                    let t = parse_tool(t)?;
+                    let parameters = rt::json(&t.parameters);
+                    Ok(rt::Value::map(vec![
+                        (
+                            "description",
+                            rt::Value::data(t.description.as_deref().unwrap_or("")),
+                        ),
+                        ("name", rt::Value::data(&t.name)),
+                        (
+                            "parameters",
+                            if rt::truthy(&parameters) {
+                                parameters
+                            } else {
+                                rt::Value::map(Vec::new())
+                            },
+                        ),
+                        ("type", rt::Value::lit("function")),
+                    ]))
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            let u = rt::Value::Undefined;
+            let json = rt::f_tojson_sep(
+                &rt::Value::list(specs),
+                &u,
+                &u,
+                &rt::Value::Bool(true),
+                ",",
+                ":",
+            )
+            .map_err(|e| Error::Template(e.0))?;
+            tools = Some(rt::to_str(&json).text());
+        }
+        let system = self.system_prompt();
+        let mut parts = Vec::new();
+        if let Some(t) = &tools {
+            parts.extend([
+                Template("<|message_system|>tool_declare<|content_xml|>"),
+                Content(t),
+                Template("<|end_message|>"),
+            ]);
+        }
+        if let Some(s) = &system {
+            parts.extend([
+                Template("<|message_system|><|content_text|>"),
+                Content(s),
+                Template("<|end_message|>"),
+            ]);
+        }
+        parts.extend([
+            Template("<|message_system|><|content_text|>Thinking effort level: "),
+            Content(self.inkling_effort()),
+            Template("<|end_message|>"),
+        ]);
+        Ok(self.tok.encode_prompt(&parts))
+    }
+
+    /// The tokens of the next turn in Inkling's built-in format: what is left
+    /// of the previous answer, the system blocks on the first turn, `message`.
+    /// No generation prompt: the model writes its header itself.
+    fn inkling_turn(&self, message: &[PromptPart<'_>]) -> Result<Vec<TokenId>, Error> {
+        let mut t = self.pending.clone();
+        if self.session.n_past() == 0 {
+            t.extend(self.inkling_system()?);
+        }
+        t.extend(self.tok.encode_prompt(message));
+        Ok(t)
     }
 
     /// The system block, as the chat template writes it, with the
@@ -871,12 +1364,19 @@ impl<'m> Chat<'m> {
             (None, Format::Flint { .. }) => {
                 self.turn_tokens(&[Template("<|user|>"), Content(&flint_text(user))])
             }
+            (None, Format::Inkling(_)) => self.inkling_turn(&[
+                Template("<|message_user|><|content_text|>"),
+                Content(user),
+                Template("<|end_message|>"),
+            ])?,
         };
         self.answer(prompt, sampler, on_event, stop)
     }
 
     /// Send the results of the function calls of the last answer, in their
-    /// order, and stream the answer as [`Chat::send`] does
+    /// order, and stream the answer as [`Chat::send`] does. Each is named by
+    /// its call's function, for templates that write it, when there are as
+    /// many as calls.
     pub fn send_tool_responses(
         &mut self,
         responses: &[impl AsRef<str>],
@@ -884,16 +1384,41 @@ impl<'m> Chat<'m> {
         on_event: impl FnMut(Event<'_>),
         stop: impl Fn() -> bool,
     ) -> Result<TurnStats, Error> {
+        let names: &[String] = if self.calls.len() == responses.len() {
+            &self.calls
+        } else {
+            &[]
+        };
         if let Some(t) = self.template {
             let messages: Vec<rt::Message> = responses
                 .iter()
-                .map(|r| rt::Message::new(rt::Role::Tool, r.as_ref()))
+                .enumerate()
+                .map(|(i, r)| rt::Message {
+                    name: names.get(i).cloned(),
+                    ..rt::Message::new(rt::Role::Tool, r.as_ref())
+                })
                 .collect();
             let prompt = self.template_turn(t, &messages)?;
             return self.answer(prompt, sampler, on_event, stop);
         }
+        if let Format::Inkling(_) = self.format {
+            let mut message = Vec::new();
+            for (i, r) in responses.iter().enumerate() {
+                message.push(Template("<|message_tool|>"));
+                if let Some(name) = names.get(i) {
+                    message.push(Content(name));
+                }
+                message.extend([
+                    Template("<|content_text|>"),
+                    Content(r.as_ref()),
+                    Template("<|end_message|>"),
+                ]);
+            }
+            let prompt = self.inkling_turn(&message)?;
+            return self.answer(prompt, sampler, on_event, stop);
+        }
         let flint: Vec<Cow<'_, str>> = match self.format {
-            Format::ChatMl { .. } => Vec::new(),
+            Format::ChatMl { .. } | Format::Inkling(_) => Vec::new(),
             Format::Flint { .. } => responses.iter().map(|r| flint_text(r.as_ref())).collect(),
         };
         let mut message = Vec::new();
@@ -951,6 +1476,12 @@ impl<'m> Chat<'m> {
             Format::ChatMl { .. } => (self.opts.thinking, None),
             // the model opens its reasoning block itself
             Format::Flint { think } => (false, Some(think)),
+            // all its blocks are the reader's
+            Format::Inkling(_) => (false, None),
+        };
+        let mut inkling = match self.format {
+            Format::Inkling(f) => Some(InklingReader::new(f)),
+            _ => None,
         };
         let mut decoder = StreamDecoder::default();
         // the template puts "\n\n" after </think>: don't echo it
@@ -965,6 +1496,15 @@ impl<'m> Chat<'m> {
             stats.gen_tokens += 1;
             self.generated.push(next);
 
+            if let Some(r) = &mut inkling
+                && (self.is_end(next) || r.ends(next))
+            {
+                // the end of sampling, never `<|endoftext|>`, closes the
+                // answer in the history, after the open block's end
+                let closing = r.close(&mut stats.tool_calls, &mut on_event);
+                self.pending.extend(closing);
+                break;
+            }
             if self.is_end(next) {
                 if let Some(text) = call.take() {
                     on_event(Event::Answer(&format!("<tool_call>{text}")));
@@ -976,20 +1516,22 @@ impl<'m> Chat<'m> {
                 }
                 break;
             }
-            if Some(next) == think && !thinking && call.is_none() {
+            if let Some(r) = &mut inkling {
+                r.token(next, self.tok, &mut stats.tool_calls, &mut on_event);
+            } else if Some(next) == think && !thinking && call.is_none() {
                 thinking = true;
                 held_newlines.clear();
                 skip_leading_newlines = true;
-            } else if next == self.think_end && thinking {
+            } else if Some(next) == self.think_end && thinking {
                 thinking = false;
                 skip_leading_newlines = true;
                 held_newlines.clear();
                 on_event(Event::ThinkingDone);
-            } else if next == self.tool_call && !thinking && call.is_none() {
+            } else if Some(next) == self.tool_call && !thinking && call.is_none() {
                 // the newlines before a call are not part of the answer
                 held_newlines.clear();
                 call = Some(String::new());
-            } else if next == self.tool_call_end && call.is_some() {
+            } else if Some(next) == self.tool_call_end && call.is_some() {
                 let text = call.take().unwrap_or_default();
                 match ToolCall::parse_as(self.format, &text) {
                     Some(c) => {
@@ -1030,12 +1572,17 @@ impl<'m> Chat<'m> {
                 stats.truncated = true;
                 // close the message so the history stays well-formed
                 self.pending.push(next);
+                if let Some(r) = &mut inkling {
+                    let closing = r.close(&mut stats.tool_calls, &mut on_event);
+                    self.pending.extend(closing);
+                    break;
+                }
                 if thinking {
-                    self.pending.push(self.think_end);
+                    self.pending.extend(self.think_end);
                 }
                 if let Some(text) = call.take() {
                     on_event(Event::Answer(&format!("<tool_call>{text}")));
-                    self.pending.push(self.tool_call_end);
+                    self.pending.extend(self.tool_call_end);
                 }
                 if let Format::ChatMl { im_end } = self.format {
                     self.pending.push(im_end);
@@ -1045,6 +1592,7 @@ impl<'m> Chat<'m> {
             logits = self.advance(next, &mut spec, &mut stats, sampler);
         }
         self.settle(&mut spec);
+        self.calls = stats.tool_calls.iter().map(|c| c.name.clone()).collect();
         Ok(stats)
     }
 
@@ -1336,6 +1884,35 @@ mod tests {
     use crate::prelude::*;
     use crate::sampler::{Sampler, SamplerConfig};
 
+    /// `high` is `xhigh` for Qwen, as its templates resolve it
+    #[test]
+    fn high_effort_is_qwens_xhigh() {
+        use super::{ReasoningEffort, compiled, rt};
+        assert_eq!(
+            ReasoningEffort::High.instructions(),
+            ReasoningEffort::XHigh.instructions()
+        );
+        let messages = [rt::Message::new(rt::Role::User, "Q")];
+        for t in [
+            compiled::Template::Qwen35,
+            compiled::Template::Qwen36,
+            compiled::Template::Qwen38,
+        ] {
+            let render = |effort: ReasoningEffort| {
+                let p = compiled::Params {
+                    messages: &messages,
+                    add_generation_prompt: true,
+                    enable_thinking: Some(true),
+                    reasoning_effort: Some(effort.as_str()),
+                    ..Default::default()
+                };
+                t.render(&p).unwrap().text()
+            };
+            let high = render(ReasoningEffort::parse("high").unwrap());
+            assert_eq!(high, render(ReasoningEffort::XHigh), "{t:?}");
+        }
+    }
+
     #[test]
     fn flint_text_escapes_roles() {
         assert!(matches!(flint_text("plain"), Cow::Borrowed("plain")));
@@ -1428,5 +2005,558 @@ mod tests {
         assert_eq!(continuation(&h, 3), Some((3, vec![1, 0, 1])));
         // a run of one token
         assert_eq!(continuation(&[4, 4, 4, 4], 3), Some((3, vec![4, 4, 4])));
+    }
+}
+
+#[cfg(test)]
+mod inkling_tests {
+    //! Inkling-2's chat on a scripted engine: the model's answers are given,
+    //! and the sequence the chat processes is checked against the reference,
+    //! Hugging Face `tokenizers`' ids of the Jinja2 render (transformers'
+    //! settings) of the whole conversation
+
+    use core::cell::RefCell;
+    use std::sync::OnceLock;
+
+    use super::*;
+    use crate::memory::ModelMemory;
+    use crate::sampler::SamplerConfig;
+
+    fn tok() -> Option<&'static Tokenizer> {
+        static TOK: OnceLock<Option<Tokenizer>> = OnceLock::new();
+        TOK.get_or_init(crate::tokenizer::tests::inkling2).as_ref()
+    }
+
+    /// An engine whose model generates the tokens of `script`, in order,
+    /// whatever it is given, and whose session's sequence is `seq`
+    struct Scripted {
+        n_vocab: usize,
+        script: RefCell<VecDeque<TokenId>>,
+        seq: RefCell<Vec<TokenId>>,
+    }
+
+    impl Scripted {
+        fn new(tok: &Tokenizer, answers: &[&str]) -> Self {
+            Scripted {
+                n_vocab: tok.n_vocab(),
+                script: RefCell::new(
+                    answers
+                        .iter()
+                        .flat_map(|a| tok.encode_with_special(a))
+                        .collect(),
+                ),
+                seq: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Engine for Scripted {
+        fn new_session(&self, _: usize, _: usize) -> Result<Box<dyn Session + '_>, Error> {
+            self.seq.borrow_mut().clear();
+            Ok(Box::new(ScriptedSession(self)))
+        }
+        fn batch_size(&self) -> usize {
+            // passes that don't end where the blocks do
+            7
+        }
+        fn draft_size(&self) -> usize {
+            0
+        }
+        fn description(&self) -> String {
+            "scripted".into()
+        }
+        fn model_memory(&self) -> ModelMemory {
+            ModelMemory::default()
+        }
+        fn session_memory(&self, _: usize, _: usize) -> SessionMemory {
+            SessionMemory::default()
+        }
+        fn numerics(&self) -> Vec<(&'static str, String)> {
+            Vec::new()
+        }
+    }
+
+    struct ScriptedSession<'a>(&'a Scripted);
+
+    impl Session for ScriptedSession<'_> {
+        fn forward(&mut self, tokens: &[TokenId]) -> Vec<f32> {
+            self.0.seq.borrow_mut().extend_from_slice(tokens);
+            let next = self
+                .0
+                .script
+                .borrow_mut()
+                .pop_front()
+                .expect("a scripted token");
+            let mut logits = vec![0.0; self.0.n_vocab];
+            logits[next as usize] = 1.0;
+            logits
+        }
+        fn prefill(&mut self, tokens: &[TokenId]) {
+            self.0.seq.borrow_mut().extend_from_slice(tokens);
+        }
+        fn draft(
+            &mut self,
+            _: TokenId,
+            _: usize,
+            _: &mut dyn FnMut(&DraftLogits<'_>) -> TokenId,
+        ) -> Vec<TokenId> {
+            Vec::new()
+        }
+        fn verify(&mut self, _: &[TokenId]) -> Vec<Vec<f32>> {
+            unreachable!()
+        }
+        fn keep(&mut self, _: usize) {}
+        fn n_past(&self) -> usize {
+            self.0.seq.borrow().len()
+        }
+        fn memory(&self) -> SessionMemory {
+            SessionMemory::default()
+        }
+        fn snapshot(&self) -> Result<Snapshot, Error> {
+            let seq = self.0.seq.borrow().clone();
+            Ok(Snapshot::new(seq.len(), 0, seq))
+        }
+        fn restore(&mut self, s: &Snapshot) -> Result<(), Error> {
+            *self.0.seq.borrow_mut() = s.data::<Vec<TokenId>>()?.clone();
+            Ok(())
+        }
+    }
+
+    fn greedy() -> Sampler {
+        Sampler::new(SamplerConfig {
+            temperature: 0.0,
+            ..Default::default()
+        })
+    }
+
+    /// What a turn showed: the reasoning, the text, the calls
+    #[derive(Debug, Default, PartialEq)]
+    struct Shown {
+        thinking: String,
+        done: usize,
+        answer: String,
+        calls: Vec<ToolCall>,
+    }
+
+    /// A turn: `user`'s message, or else the results of the last calls
+    fn turn(chat: &mut Chat<'_>, user: Option<&str>, results: &[&str]) -> Shown {
+        let mut s = Shown::default();
+        let on_event = |ev: Event<'_>| match ev {
+            Event::Thinking(t) => s.thinking.push_str(t),
+            Event::ThinkingDone => s.done += 1,
+            Event::Answer(t) => s.answer.push_str(t),
+            Event::ToolCall(c) => s.calls.push(c.clone()),
+            Event::PromptDone => {}
+        };
+        let stats = match user {
+            Some(u) => chat.send(u, &mut greedy(), on_event, || false),
+            None => chat.send_tool_responses(results, &mut greedy(), on_event, || false),
+        }
+        .unwrap();
+        assert_eq!(stats.tool_calls, s.calls);
+        s
+    }
+
+    const WEATHER: &str = r#"{"type": "function", "function": {"name": "get_weather", "description": "Current weather in a city", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name"}}, "required": ["city"]}}}"#;
+    const TIME: &str = r#"{"type": "function", "function": {"name": "get_time", "description": "Current local time in an IANA time zone", "parameters": {"type": "object", "properties": {"timezone": {"type": "string"}}, "required": ["timezone"]}}}"#;
+
+    /// The model's answers of the conversation with tools
+    const TOOL_ANSWERS: [&str; 3] = [
+        r#"<|message_model|><|content_thinking|>Two tools.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Paris"}}<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{"name":"get_time","args":{"timezone":"Asia/Tokyo"}}<|end_message|><|content_model_end_sampling|>"#,
+        "<|message_model|><|content_text|>It is 18 °C with light rain in Paris, and 19:42 in Tokyo.<|end_message|><|content_model_end_sampling|>",
+        "<|message_model|><|content_text|>Paris: 18 °C, rain; Tokyo: 19:42.<|end_message|><|content_model_end_sampling|>",
+    ];
+    #[rustfmt::skip]
+    const TOOLS: &[TokenId] = &[
+        200002, 2251, 62, 76529, 200024, 58, 90, 1, 70469, 1, 25, 1, 36515, 154046, 149881,
+        149878, 152652, 1, 11, 1, 930, 1, 25, 1, 832, 62, 30847, 1, 11, 1, 71968, 1, 25, 90, 1,
+        71961, 1, 25, 90, 1, 2958, 1, 25, 90, 1, 70469, 1, 25, 1, 3278, 150231, 1, 11, 1, 1008,
+        1, 25, 1, 1485, 1, 92, 92, 11, 1, 69812, 1, 25, 58, 1, 2958, 1, 60, 11, 1, 1008, 1, 25,
+        1, 3156, 1, 92, 11, 1, 1008, 1, 25, 1, 36404, 1, 92, 11, 90, 1, 70469, 1, 25, 1, 36515,
+        150368, 150038, 149881, 149916, 220, 148818, 150038, 152964, 1, 11, 1, 930, 1, 25, 1,
+        832, 62, 848, 1, 11, 1, 71968, 1, 25, 90, 1, 71961, 1, 25, 90, 1, 848, 3746, 1, 25, 90,
+        1, 1008, 1, 25, 1, 1485, 1, 92, 92, 11, 1, 69812, 1, 25, 58, 1, 848, 3746, 1, 60, 11, 1,
+        1008, 1, 25, 1, 3156, 1, 92, 11, 1, 1008, 1, 25, 1, 36404, 1, 92, 60, 200010, 200002,
+        200004, 1735, 149914, 149878, 160385, 171159, 13, 200010, 200002, 200004, 34182, 279,
+        154554, 150628, 25, 220, 15, 13, 68436, 200010, 200000, 200004, 1775, 6, 82, 149876,
+        154046, 149881, 152717, 11, 149880, 149876, 150038, 149881, 182416, 30, 200010, 200001,
+        200008, 4348, 152804, 13, 200010, 200001, 832, 62, 30847, 200049, 90, 1, 930, 1, 25, 1,
+        832, 62, 30847, 1, 11, 1, 70747, 1, 25, 90, 1, 2958, 1, 25, 1, 3967, 1, 92, 92, 200010,
+        200001, 832, 62, 848, 200049, 90, 1, 930, 1, 25, 1, 832, 62, 848, 1, 11, 1, 70747, 1,
+        25, 90, 1, 848, 3746, 1, 25, 1, 4997, 14, 34664, 1, 92, 92, 200010, 200006, 200003, 832,
+        62, 30847, 200004, 90, 1, 70799, 1, 25, 220, 68073, 11, 196980, 32667, 1, 25, 196980,
+        1638, 154005, 1, 92, 200010, 200003, 832, 62, 848, 200004, 90, 1, 848, 1, 25, 196980,
+        68111, 21, 12, 68026, 12, 68120, 51, 68028, 25, 68872, 25, 68018, 10, 68609, 25, 68018,
+        1, 92, 200010, 200001, 200004, 1256, 149884, 220, 68073, 153620, 34, 149899, 150932,
+        154005, 149881, 152717, 11, 149880, 220, 68028, 25, 68872, 149881, 182416, 13, 200010,
+        200006, 200000, 200004, 78028, 13, 159336, 149921, 151433, 149881, 150011, 150921,
+        156021, 13, 200010, 200001, 200004, 3967, 25, 220, 68073, 153620, 34, 11, 154005, 26,
+        182416, 25, 220, 68028, 25, 68872, 13, 200010, 200006
+    ];
+    /// The conversation with tools, thinking on (xhigh), in a chat from `opts`
+    fn tools_conversation(tok: &Tokenizer, opts: &ChatOptions, saved: bool) -> Vec<TokenId> {
+        let engine = Scripted::new(tok, &TOOL_ANSWERS);
+        let mut chat = Chat::new(&engine, tok, opts.clone()).unwrap();
+        if saved {
+            let prefix = chat.save().unwrap();
+            chat.reset().unwrap();
+            chat.restore(&prefix).unwrap();
+        }
+        let s = turn(
+            &mut chat,
+            Some("What's the weather in Paris, and the time in Tokyo?"),
+            &[],
+        );
+        assert_eq!(s.thinking, "Two tools.");
+        assert_eq!((s.done, s.answer.as_str()), (1, ""));
+        let call = |name: &str, k: &str, v: &str| ToolCall {
+            name: name.into(),
+            arguments: vec![(k.into(), v.into())],
+        };
+        assert_eq!(
+            s.calls,
+            [
+                call("get_weather", "city", "Paris"),
+                call("get_time", "timezone", "Asia/Tokyo")
+            ]
+        );
+        let s = turn(
+            &mut chat,
+            None,
+            &[
+                r#"{"temperature": 18, "condition": "light rain"}"#,
+                r#"{"time": "2026-10-30T19:42:00+09:00"}"#,
+            ],
+        );
+        assert_eq!(
+            s.answer,
+            "It is 18 °C with light rain in Paris, and 19:42 in Tokyo."
+        );
+        let s = turn(
+            &mut chat,
+            Some("Thanks. Say it again in one short sentence."),
+            &[],
+        );
+        assert_eq!(s.answer, "Paris: 18 °C, rain; Tokyo: 19:42.");
+        let t = chat.transcript();
+        // everything is processed but the end of the last answer
+        assert_eq!(*engine.seq.borrow(), t.tokens[..t.tokens.len() - t.pending]);
+        assert_eq!(t.tokens[t.tokens.len() - t.pending..], [200006]);
+        t.tokens
+    }
+
+    #[test]
+    fn inkling_chat_needs_no_qwen_tokens() {
+        let Some(tok) = tok() else {
+            std::eprintln!("no Inkling-2-Mini GGUF: skipped");
+            return;
+        };
+        let engine = Scripted::new(tok, &[]);
+        let chat = Chat::new(&engine, tok, ChatOptions::default()).unwrap();
+        assert!(matches!(chat.format, Format::Inkling(_)));
+        assert_eq!(chat.template(), Some(compiled::Template::Inkling2));
+        assert!(chat.controls_thinking() && chat.thinking_per_conversation());
+        assert_eq!(tok.eog, [200006, 199999]);
+    }
+
+    #[test]
+    fn inkling_conversation_with_tools() {
+        let Some(tok) = tok() else {
+            std::eprintln!("no Inkling-2-Mini GGUF: skipped");
+            return;
+        };
+        let opts = ChatOptions {
+            system: Some("You are a helpful assistant.".into()),
+            tools: vec![WEATHER.into(), TIME.into()],
+            ..Default::default()
+        };
+        let builtin = ChatOptions {
+            builtin_format: true,
+            ..opts.clone()
+        };
+        for (opts, saved) in [
+            (&opts, false),
+            (&builtin, false),
+            (&opts, true),
+            (&builtin, true),
+        ] {
+            let what = (opts.builtin_format, saved);
+            assert_eq!(tools_conversation(tok, opts, saved), TOOLS, "{what:?}");
+        }
+    }
+
+    /// The model's answers of the conversation without thinking: reasoning
+    /// anyway in the second
+    const PLAIN_ANSWERS: [&str; 2] = [
+        "<|message_model|><|content_text|>Hello!<|end_message|><|content_model_end_sampling|>",
+        "<|message_model|><|content_thinking|>Short.<|end_message|><|message_model|><|content_text|>Bye!<|end_message|><|content_model_end_sampling|>",
+    ];
+    #[rustfmt::skip]
+    const PLAIN: &[TokenId] = &[
+        200002, 200004, 34182, 279, 154554, 150628, 25, 220, 15, 200010, 200000, 200004, 153725,
+        198, 200010, 200001, 200004, 32269, 0, 200010, 200006, 200000, 200004, 48135, 200010,
+        200001, 200008, 31485, 13, 200010, 200001, 200004, 48135, 0, 200010, 200006
+    ];
+    #[test]
+    fn inkling_conversation_without_thinking() {
+        let Some(tok) = tok() else {
+            std::eprintln!("no Inkling-2-Mini GGUF: skipped");
+            return;
+        };
+        for builtin_format in [false, true] {
+            let opts = ChatOptions {
+                thinking: false,
+                // a blank system prompt is none
+                system: Some(" \n".into()),
+                builtin_format,
+                ..Default::default()
+            };
+            let engine = Scripted::new(tok, &PLAIN_ANSWERS);
+            let mut chat = Chat::new(&engine, tok, opts).unwrap();
+            assert_eq!(turn(&mut chat, Some(" Hi\n"), &[]).answer, "Hello!");
+            let s = turn(&mut chat, Some("Bye"), &[]);
+            assert_eq!((s.thinking.as_str(), s.done), ("Short.", 1));
+            assert_eq!(s.answer, "Bye!");
+            assert_eq!(chat.transcript().tokens, PLAIN, "built-in {builtin_format}");
+        }
+    }
+
+    /// The first turn's tokens, the same whatever the effort and the way
+    /// they are rendered
+    #[test]
+    fn inkling_effort_levels() {
+        let Some(tok) = tok() else {
+            std::eprintln!("no Inkling-2-Mini GGUF: skipped");
+            return;
+        };
+        let answer =
+            ["<|message_model|><|content_text|>A<|end_message|><|content_model_end_sampling|>"];
+        for (thinking, effort, level) in [
+            (true, ReasoningEffort::Low, "0.2"),
+            (true, ReasoningEffort::Medium, "0.7"),
+            (true, ReasoningEffort::High, "0.9"),
+            (true, ReasoningEffort::XHigh, "0.99"),
+            (false, ReasoningEffort::XHigh, "0"),
+            (false, ReasoningEffort::Low, "0"),
+        ] {
+            let first = |builtin_format: bool| {
+                let opts = ChatOptions {
+                    thinking,
+                    effort,
+                    builtin_format,
+                    ..Default::default()
+                };
+                let engine = Scripted::new(tok, &answer);
+                let mut chat = Chat::new(&engine, tok, opts).unwrap();
+                turn(&mut chat, Some("Q"), &[]);
+                chat.transcript().tokens
+            };
+            let want = tok.encode_with_special(&format!(
+                "<|message_system|><|content_text|>Thinking effort level: {level}<|end_message|><|message_user|><|content_text|>Q<|end_message|>{}",
+                answer[0]
+            ));
+            assert_eq!(first(false), want, "{thinking} {effort:?}");
+            assert_eq!(first(true), want, "{thinking} {effort:?}");
+        }
+    }
+
+    /// However an answer ends, the sequence goes on as the template writes
+    /// the end of an answer: `…<|end_message|><|content_model_end_sampling|>`
+    #[test]
+    fn inkling_answer_endings() {
+        let Some(tok) = tok() else {
+            std::eprintln!("no Inkling-2-Mini GGUF: skipped");
+            return;
+        };
+        let opening = "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Q<|end_message|>";
+        let next = "<|message_user|><|content_text|>Next<|end_message|>";
+        let done =
+            "<|message_model|><|content_text|>B<|end_message|><|content_model_end_sampling|>";
+        // generated, max_tokens, the answer as the sequence has it
+        for (generated, max_tokens, closed) in [
+            (
+                "<|message_model|><|content_text|>Hi<|end_message|><|endoftext|>",
+                100,
+                "<|message_model|><|content_text|>Hi<|end_message|><|content_model_end_sampling|>",
+            ),
+            (
+                "<|message_model|><|content_text|>Hi<|content_model_end_sampling|>",
+                100,
+                "<|message_model|><|content_text|>Hi<|end_message|><|content_model_end_sampling|>",
+            ),
+            (
+                // cut by max_tokens in a block
+                "<|message_model|><|content_text|>Hello",
+                3,
+                "<|message_model|><|content_text|>Hello<|end_message|><|content_model_end_sampling|>",
+            ),
+            (
+                "<|message_model|><|content_text|>Hi<|end_message|>",
+                4,
+                "<|message_model|><|content_text|>Hi<|end_message|><|content_model_end_sampling|>",
+            ),
+            (
+                "<|message_model|>",
+                1,
+                "<|message_model|><|end_message|><|content_model_end_sampling|>",
+            ),
+            // another role's header ends the answer, and is left out
+            (
+                "<|message_model|><|content_text|>Hi<|end_message|><|message_user|>",
+                100,
+                "<|message_model|><|content_text|>Hi<|end_message|><|content_model_end_sampling|>",
+            ),
+            // nothing but the end: an answer without content
+            (
+                "<|content_model_end_sampling|>",
+                100,
+                "<|content_model_end_sampling|>",
+            ),
+            // text outside any block, after one or before any: no block is
+            // open, the sequence keeps it as the model wrote it
+            (
+                "<|message_model|><|content_text|>Hi<|end_message|>\n<|content_model_end_sampling|>",
+                100,
+                "<|message_model|><|content_text|>Hi<|end_message|>\n<|content_model_end_sampling|>",
+            ),
+            (
+                "<|message_model|><|content_text|>Hi<|end_message|>ok",
+                5,
+                "<|message_model|><|content_text|>Hi<|end_message|>ok<|content_model_end_sampling|>",
+            ),
+            (
+                "Hello<|content_model_end_sampling|>",
+                100,
+                "Hello<|content_model_end_sampling|>",
+            ),
+        ] {
+            for builtin_format in [false, true] {
+                let opts = ChatOptions {
+                    max_tokens,
+                    builtin_format,
+                    ..Default::default()
+                };
+                let engine = Scripted::new(tok, &[generated, done]);
+                let mut chat = Chat::new(&engine, tok, opts).unwrap();
+                turn(&mut chat, Some("Q"), &[]);
+                chat.opts.max_tokens = 100;
+                assert_eq!(turn(&mut chat, Some("Next"), &[]).answer, "B");
+                let want = tok.encode_with_special(&format!("{opening}{closed}{next}{done}"));
+                assert_eq!(
+                    chat.transcript().tokens,
+                    want,
+                    "{generated:?}, built-in {builtin_format}"
+                );
+            }
+        }
+    }
+
+    /// The answer's blocks as events, from tokens: whatever the reference
+    /// parsers take
+    #[test]
+    fn inkling_reader() {
+        let Some(tok) = tok() else {
+            std::eprintln!("no Inkling-2-Mini GGUF: skipped");
+            return;
+        };
+        let engine = Scripted::new(tok, &[]);
+        let Format::Inkling(f) = Chat::new(&engine, tok, ChatOptions::default())
+            .unwrap()
+            .format
+        else {
+            panic!("not Inkling's format");
+        };
+        let read = |text: &str| {
+            let mut r = InklingReader::new(f);
+            let mut s = Shown::default();
+            let mut calls = Vec::new();
+            let mut on_event = |ev: Event<'_>| match ev {
+                Event::Thinking(t) => s.thinking.push_str(t),
+                Event::ThinkingDone => s.done += 1,
+                Event::Answer(t) => s.answer.push_str(t),
+                Event::ToolCall(c) => s.calls.push(c.clone()),
+                Event::PromptDone => {}
+            };
+            for t in tok.encode_with_special(text) {
+                r.token(t, tok, &mut calls, &mut on_event);
+            }
+            let closing = r.close(&mut calls, &mut on_event);
+            assert_eq!(calls, s.calls);
+            (s, closing)
+        };
+        let call = |name: &str, args: &[(&str, &str)]| ToolCall {
+            name: name.into(),
+            arguments: args.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
+        };
+        // text blocks are joined, not trimmed; leading newlines dropped
+        let (s, closing) = read(
+            "<|message_model|><|content_text|>\n\nA \n<|end_message|><|message_model|><|content_text|>B<|end_message|>",
+        );
+        assert_eq!((s.answer.as_str(), &closing[..]), ("A \nB", &[200006][..]));
+        // a call without the name before it, JSON with spaces and values of
+        // every kind: the JSON's name is the one
+        let (s, _) = read(
+            r#"<|message_model|><|content_invoke_tool_json|>{"name": "f", "args": {"s": "x y", "n": 1.5, "o": {"b": [1, null], "a": true}}}<|end_message|><|message_model|>other<|content_invoke_tool_json|>{"name":"g","args":{}}<|end_message|>"#,
+        );
+        assert_eq!(
+            s.calls,
+            [
+                call(
+                    "f",
+                    &[
+                        ("s", "x y"),
+                        ("n", "1.5"),
+                        ("o", r#"{"b":[1,null],"a":true}"#)
+                    ]
+                ),
+                call("g", &[])
+            ]
+        );
+        // numbers as the model wrote them, past i64 and f64 too; a key
+        // given twice is its last value, as Python's json
+        let (s, _) = read(
+            r#"<|message_model|><|content_invoke_tool_json|>{"name":"f","args":{"id": 12345678901234567890, "x":1e400,"y":[1E5, "a \" ]"],"id":-0.10}, "args2": 1}<|end_message|>"#,
+        );
+        assert_eq!(
+            s.calls,
+            [call(
+                "f",
+                &[("id", "-0.10"), ("x", "1e400"), ("y", r#"[1E5,"a \" ]"]"#)]
+            )]
+        );
+        // the header's name when the JSON has none; no header at all
+        let (s, _) = read(
+            r#"<|message_model|> h <|content_invoke_tool_json|>{"args":{"k":"v"}}<|end_message|><|content_text|>after<|end_message|>"#,
+        );
+        assert_eq!(
+            (s.calls, s.answer.as_str()),
+            (vec![call("h", &[("k", "v")])], "after")
+        );
+        // not a call: shown as it was written
+        let (s, _) =
+            read("<|message_model|><|content_invoke_tool_json|>{\"args\": 1}<|end_message|>");
+        assert_eq!((s.calls.len(), s.answer.as_str()), (0, "{\"args\": 1}"));
+        // a call cut short at the end, complete or not
+        let (s, closing) =
+            read(r#"<|message_model|><|content_invoke_tool_json|>{"name":"f","args":{}}"#);
+        assert_eq!(
+            (s.calls, &closing[..]),
+            (vec![call("f", &[])], &[200010, 200006][..])
+        );
+        let (s, _) = read(r#"<|message_model|><|content_invoke_tool_json|>{"name":"f","ar"#);
+        assert_eq!(
+            (s.calls.len(), s.answer.as_str()),
+            (0, r#"{"name":"f","ar"#)
+        );
+        // reasoning, then text; an error and a call as text show as text; an
+        // image's block does not
+        let (s, closing) = read(
+            "<|message_model|><|content_thinking|>\nhmm\n<|end_message|><|message_model|><|content_text|>\nok<|end_message|><|message_model|><|content_tool_error|>E<|end_message|><|message_model|><|content_invoke_tool_text|>T<|end_message|><|message_model|><|content_image|>img<|end_message|><|message_model|><|content_text|>",
+        );
+        assert_eq!((s.thinking.as_str(), s.done), ("hmm", 1));
+        assert_eq!(
+            (s.answer.as_str(), &closing[..]),
+            ("okET", &[200010, 200006][..])
+        );
     }
 }

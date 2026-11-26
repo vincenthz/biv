@@ -90,13 +90,50 @@ fn field(name: &str) -> String {
     }
 }
 
+/// `source` with transformers' `{% generation %}` and `{% endgeneration %}`
+/// tags, which mark the assistant's text for training masks and render their
+/// body as it is, made `{% if true %}` and `{% endif %}`: their whitespace
+/// control kept, on the same line
+fn rewrite_generation(source: &str) -> std::borrow::Cow<'_, str> {
+    // the tag's word at the start of `rest`: its offset, length and new word
+    let tag = |rest: &str| -> Option<(usize, usize, &'static str)> {
+        let inner = rest.strip_prefix("{%")?;
+        let inner = inner.strip_prefix(['-', '+']).unwrap_or(inner).trim_start();
+        let (word, by) = [("endgeneration", "endif"), ("generation", "if true")]
+            .into_iter()
+            .find(|(w, _)| inner.starts_with(w))?;
+        let after = inner[word.len()..].trim_start();
+        let after = after.strip_prefix(['-', '+']).unwrap_or(after);
+        after
+            .starts_with("%}")
+            .then_some((rest.len() - inner.len(), word.len(), by))
+    };
+    let (mut out, mut done, mut at) = (String::new(), 0, 0);
+    while let Some(i) = source[at..].find("{%") {
+        let start = at + i;
+        at = start + 2;
+        if let Some((offset, len, by)) = tag(&source[start..]) {
+            out.push_str(&source[done..start + offset]);
+            out.push_str(by);
+            done = start + offset + len;
+        }
+    }
+    if done == 0 {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    out.push_str(&source[done..]);
+    std::borrow::Cow::Owned(out)
+}
+
 pub fn generate(source: &str, opts: &Options<'_>) -> Result<Generated, GenError> {
     let config = SyntaxConfig::builder()
         .trim_blocks(true)
         .lstrip_blocks(true)
         .build()
         .expect("the default syntax");
-    let root = parse(source, "template", config).map_err(|e| GenError {
+    // the hash below is of the text as it is
+    let text = rewrite_generation(source);
+    let root = parse(&text, "template", config).map_err(|e| GenError {
         line: e.line().unwrap_or(0),
         msg: e.detail().unwrap_or("syntax error").to_string(),
     })?;
@@ -1266,18 +1303,53 @@ impl Gen {
                 // transformers' own: (x, ensure_ascii=False, indent=None,
                 // separators=None, sort_keys=False)
                 let a = args(&["ensure_ascii", "indent", "separators", "sort_keys"])?;
-                if let Some(s) = a[2]
-                    && !matches!(s, ast::Expr::Const(c) if c.value.is_none())
-                {
-                    return fail(span, "the tojson filter's separators");
+                // separators: none, or a constant pair of strings
+                let separators = match a[2].map(|s| s.as_const()) {
+                    None => None,
+                    Some(Some(c)) if c.is_none() => None,
+                    Some(Some(c))
+                        if matches!(c.kind(), ValueKind::Seq)
+                            && c.len() == Some(2)
+                            && c.try_iter()
+                                .is_ok_and(|mut i| i.all(|x| x.kind() == ValueKind::String)) =>
+                    {
+                        let mut i = c.try_iter().expect("a sequence");
+                        let mut next = || i.next().expect("two items").as_str().unwrap().to_owned();
+                        Some((next(), next()))
+                    }
+                    Some(_) => {
+                        return fail(span, "the tojson filter's separators, but for two strings");
+                    }
+                };
+                match separators {
+                    None => format!(
+                        "rt::f_tojson({}, {}, {}, {})?",
+                        v.r(),
+                        self.arg(a[0])?,
+                        self.arg(a[1])?,
+                        self.arg(a[3])?
+                    ),
+                    Some((item, key)) => format!(
+                        "rt::f_tojson_sep({}, {}, {}, {}, {}, {})?",
+                        v.r(),
+                        self.arg(a[0])?,
+                        self.arg(a[1])?,
+                        self.arg(a[3])?,
+                        lit(&item),
+                        lit(&key)
+                    ),
                 }
-                format!(
-                    "rt::f_tojson({}, {}, {}, {})?",
-                    v.r(),
-                    self.arg(a[0])?,
-                    self.arg(a[1])?,
-                    self.arg(a[3])?
-                )
+            }
+            "dictsort" => {
+                let a = args(&["case_sensitive", "by", "reverse"])?;
+                if a[1].is_some() || a[2].is_some() {
+                    return fail(span, "the dictsort filter's by and reverse");
+                }
+                format!("rt::f_dictsort({}, {})?", v.r(), self.arg(a[0])?)
+            }
+            "float" => {
+                let a = args(&["default"])?;
+                format!("rt::f_float({}, {})?", v.r(), self.arg(a[0])?)
             }
             name => return fail(span, format!("the {name} filter")),
         }))
@@ -1595,4 +1667,37 @@ pub fn rustfmt(code: &str) -> std::io::Result<String> {
         ));
     }
     String::from_utf8(out.stdout).map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_tags_render_their_body() {
+        for (from, to) in [
+            (
+                "{%- generation -%}{{- x -}}{%- endgeneration -%}",
+                "{%- if true -%}{{- x -}}{%- endif -%}",
+            ),
+            (
+                "a{% generation %}b{%+  endgeneration\t+%}",
+                "a{% if true %}b{%+  endif\t+%}",
+            ),
+            // other tags and text are left as they are
+            (
+                "{% set generation = 1 %}{{ 'generation' }}{% generations %}",
+                "{% set generation = 1 %}{{ 'generation' }}{% generations %}",
+            ),
+        ] {
+            assert_eq!(rewrite_generation(from), to);
+        }
+        // the hash is the original text's, which models have
+        let source = "{%- generation -%}{{- messages -}}{%- endgeneration -%}";
+        let opts = Options {
+            name: "t",
+            rt_path: "rt",
+        };
+        assert_eq!(generate(source, &opts).unwrap().hash, fnv1a(source));
+    }
 }

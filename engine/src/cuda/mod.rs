@@ -818,6 +818,11 @@ impl<'m> CudaEngine<'m> {
         reserve: usize,
     ) -> Result<Self, Error> {
         let c = &model.cfg;
+        if c.inkling.is_some() {
+            return Err(backend(
+                "cuda: inkling2_loop is not supported on this backend yet (use the cpu)",
+            ));
+        }
         if c.recurrent.contains(&true) && (c.ssm_state != SD || c.conv_kernel != 4) {
             return Err(backend(
                 "cuda: the delta net kernels expect state size 128 and conv kernel 4",
@@ -1410,7 +1415,10 @@ fn scratch_bytes(c: &Config, b: usize, logit_rows: usize) -> [usize; 18] {
     // others (attention / delta net outputs, feed-forward activations, the
     // pairs of a mixture of experts, the output head's input)
     let q0 = b * e;
-    let pairs = c.moe.as_ref().map_or(0, |m| b * m.n_expert_used * m.n_ff_exp);
+    let pairs = c
+        .moe
+        .as_ref()
+        .map_or(0, |m| b * m.n_expert_used * m.n_ff_exp);
     let q1 = (b * qd.max(c.d_inner()).max(ffn))
         .max(pairs)
         .max(logit_rows * e);
@@ -1680,10 +1688,7 @@ impl Scratch {
             beta: beta?,
             feat: feat?,
             logits: logits?,
-            q8: [
-                Q8Buf { q: q0?, ds: ds0? },
-                Q8Buf { q: q1?, ds: ds1? },
-            ],
+            q8: [Q8Buf { q: q0?, ds: ds0? }, Q8Buf { q: q1?, ds: ds1? }],
             moe,
         })
     }
@@ -2183,8 +2188,13 @@ impl CudaEngine<'_> {
                     save,
                     pad: 0,
                 };
-                self.d
-                    .launch(self.k.gdn_prep, [hk as u32, n as u32, 1], [32, 1, 1], 0, &args);
+                self.d.launch(
+                    self.k.gdn_prep,
+                    [hk as u32, n as u32, 1],
+                    [32, 1, 1],
+                    0,
+                    &args,
+                );
                 self.d.launch(
                     self.k.gdn,
                     [(sd / GDN_ROWS) as u32, hv as u32, 1],

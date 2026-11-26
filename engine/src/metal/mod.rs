@@ -27,7 +27,17 @@ use crate::prelude::*;
 use crate::quant::GgmlType;
 use crate::tokenizer::TokenId;
 
-const SOURCE: &str = include_str!("kernels.metal");
+mod inkling;
+
+/// Whether the engine runs the model: all but the `inkling2_loop` models
+/// whose geometry the kernels don't take
+pub(crate) fn supports(c: &Config) -> bool {
+    c.inkling
+        .as_ref()
+        .is_none_or(|ink| inkling::check(c, ink).is_ok())
+}
+
+const SOURCE: &str = concat!(include_str!("kernels.metal"), include_str!("inkling.metal"));
 
 /// Where the dispatches being encoded on this thread are, between
 /// [`MetalEngine::concurrent`] groups. The encoders are concurrent: a
@@ -346,6 +356,31 @@ kernels! {
     MoeRank => "moe_rank",
     MoeSort => "moe_sort",
     MoeCombine => "moe_combine",
+    // inkling2_loop, see `inkling.rs`
+    InkMix => "ink_mix",
+    InkRms => "ink_rms",
+    InkControl => "ink_control",
+    InkConv => "ink_conv",
+    InkAttnPrep => "ink_attn_prep",
+    InkAttnSplit => format!("ink_attn_split_{group}"),
+    InkAttnReduce => "ink_attn_reduce",
+    InkAttnFlash => "ink_attn_flash",
+    InkAttnFlashSplit => "ink_attn_flash_split",
+    InkSitu => "ink_situ",
+    InkMoeSum => "ink_moe_sum",
+    InkSoftcap => "ink_softcap",
+    InkCopy => "ink_copy",
+    InkMixPart => "ink_mix_part",
+    InkMixApply => "ink_mix_apply",
+    InkMixNorm => "ink_mix_norm",
+    InkRoute => "ink_route",
+    InkGateUpQ8_0 => "ink_gate_up_q8_0",
+    InkDownQ8_0 => "ink_down_q8_0",
+    InkCtrlDown => "ink_ctrl_down",
+    InkCtrlOut => "ink_ctrl_out",
+    InkCtrlNorm => "ink_ctrl_norm",
+    InkConvPar => "ink_conv_par",
+    InkConvState => "ink_conv_state",
 }
 
 /// The pipeline of every [`Kernel`], indexed by it
@@ -539,6 +574,8 @@ pub struct MetalEngine<'m> {
     inv_freq: Buffer,
     attn_nsg: usize,
     max_batch: usize,
+    /// the layers of `inkling2_loop` (then `layers` is empty)
+    ink: Option<inkling::GpuInkling>,
 }
 
 fn upload(device: &Device, data: &[f32]) -> Result<Buffer, Error> {
@@ -702,13 +739,19 @@ fn gpu_layer(device: &Device, l: &Layer<'_>) -> Result<GpuLayer, Error> {
 impl<'m> MetalEngine<'m> {
     pub fn new(model: &'m Model<'m>, max_batch: usize) -> Result<Self, Error> {
         let c = &model.cfg;
+        if let Some(ink) = &c.inkling {
+            inkling::check(c, ink)?;
+        }
         if c.recurrent.contains(&true) && (c.ssm_state != 128 || c.conv_kernel != 4) {
             return Err(backend(
                 "metal: the delta net kernels expect state size 128 and conv kernel 4",
             ));
         }
         let group = c.n_head / c.n_head_kv;
-        let attn_nsg = ATTN_GROUPS.iter().find(|g| g.0 == group).map(|g| g.1);
+        // inkling2_loop's attention is `ink_attn_split`'s, of the groups
+        // `inkling::check` takes: the unused `attn_split` pipeline is group 1's
+        let attn_group = if c.inkling.is_some() { 1 } else { group };
+        let attn_nsg = ATTN_GROUPS.iter().find(|g| g.0 == attn_group).map(|g| g.1);
         let Some(attn_nsg) = attn_nsg.filter(|_| {
             ATTN_HEAD_DIMS.contains(&c.head_dim)
                 && c.n_head.is_multiple_of(c.n_head_kv)
@@ -729,7 +772,10 @@ impl<'m> MetalEngine<'m> {
         let mut pipelines = Vec::with_capacity(Kernel::ALL.len());
         for (i, &k) in Kernel::ALL.iter().enumerate() {
             debug_assert_eq!(k as usize, i);
-            let name = k.name(c.head_dim, group);
+            let name = match k {
+                Kernel::AttnSplit => k.name(c.head_dim, attn_group),
+                _ => k.name(c.head_dim, group),
+            };
             let f = library
                 .newFunctionWithName(&NSString::from_str(&name))
                 .ok_or_else(|| backend(format!("metal: missing kernel {name}")))?;
@@ -762,6 +808,10 @@ impl<'m> MetalEngine<'m> {
             }),
             None => None,
         };
+        let ink = match &model.inkling {
+            Some(m) => Some(inkling::GpuInkling::new(&device, c, m)?),
+            None => None,
+        };
 
         Ok(MetalEngine {
             output_norm: upload(&device, &model.output_norm)?,
@@ -775,6 +825,7 @@ impl<'m> MetalEngine<'m> {
             layers,
             mtp,
             max_batch: max_batch.max(1),
+            ink,
         })
     }
 
@@ -1082,6 +1133,8 @@ struct Scratch {
     logits: Buffer,
     moe: Option<MoeScratch>,
     mtp: Option<MtpScratch>,
+    /// `inkling2_loop`'s own buffers
+    ink: Option<inkling::InkScratch>,
 }
 
 /// The buffers of a mixture of experts feed-forward, see `moe_route`
@@ -1144,6 +1197,8 @@ struct Seq {
     n_past: usize,
     /// without a scratch
     memory: SessionMemory,
+    /// the slots of `inkling2_loop` (then `layers` is empty)
+    ink: Vec<inkling::InkSlot>,
 }
 
 struct MetalSession<'e> {
@@ -1290,6 +1345,9 @@ impl Shape<'_> {
     /// What a [`Seq`] allocates, in whole pages as the device does: a
     /// session's memory but its scratch
     fn metal_seq(&self, context: usize, draft: usize, max_batch: usize) -> SessionMemory {
+        if let Some(ink) = &self.cfg.inkling {
+            return self.inkling_metal_seq(ink, context, draft, max_batch);
+        }
         let c = self.cfg;
         let mtp = self.metal_mtp(draft, max_batch);
         let slots = self.metal_draft(draft, max_batch) + 1;
@@ -1333,6 +1391,10 @@ impl Shape<'_> {
         if mtp {
             bytes += mtp_scratch_bytes(c, b).map(pages).iter().sum::<usize>();
         }
+        bytes += inkling::scratch_bytes(c, b)
+            .into_iter()
+            .map(pages)
+            .sum::<usize>();
         bytes
     }
 
@@ -1436,6 +1498,7 @@ impl Scratch {
             } else {
                 None
             },
+            ink: inkling::InkScratch::new(e, &mut a, b)?,
         };
         debug_assert_eq!(a.bytes, e.model.shape().metal_scratch(b, logit_rows, mtp));
         Ok(s)
@@ -1450,6 +1513,9 @@ impl Seq {
         draft: usize,
         max_batch: usize,
     ) -> Result<Self, Error> {
+        if e.ink.is_some() {
+            return Self::new_inkling(e, context, draft, max_batch);
+        }
         let c = e.cfg();
         let shape = e.model.shape();
         let memory = shape.metal_seq(context, draft, max_batch);
@@ -1525,6 +1591,7 @@ impl Seq {
             context,
             n_past: 0,
             memory,
+            ink: Vec::new(),
         })
     }
 
@@ -1548,6 +1615,9 @@ impl Seq {
     }
 
     fn snapshot(&self, e: &MetalEngine<'_>) -> Result<Snapshot, Error> {
+        if e.ink.is_some() {
+            return self.ink_snapshot(e);
+        }
         assert!(
             self.verify_from.is_none(),
             "snapshot between verify and keep"
@@ -1617,6 +1687,9 @@ impl Seq {
     }
 
     fn restore(&mut self, e: &MetalEngine<'_>, snapshot: &Snapshot) -> Result<(), Error> {
+        if e.ink.is_some() {
+            return self.ink_restore(e, snapshot);
+        }
         let snap: &MetalSnapshot = snapshot.data()?;
         let n_past = snapshot.n_past();
         if n_past > self.context {
@@ -1758,6 +1831,9 @@ impl MetalEngine<'_> {
     /// the attention, delta nets and MTP head per sequence. Returns the
     /// logits each [`Pass`] asks for.
     fn pass(&self, s: &Scratch, items: &mut [(&mut Seq, &[TokenId], Pass)]) -> Vec<Vec<Vec<f32>>> {
+        if let Some(ink) = &self.ink {
+            return self.ink_pass(ink, s, items);
+        }
         let c = self.cfg();
         let emb = c.n_embd;
 

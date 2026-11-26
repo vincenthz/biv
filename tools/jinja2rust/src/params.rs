@@ -64,6 +64,9 @@ fn standard(name: &str) -> Option<Kind> {
         "tools" => Kind::Tools,
         "add_generation_prompt" => Kind::Bool,
         "bos_token" | "eos_token" => Kind::Token,
+        // a level's name; templates take a number too, which goes through
+        // conditionals and filters a flag or a string doesn't
+        "reasoning_effort" => Kind::OptStr,
         _ => return None,
     })
 }

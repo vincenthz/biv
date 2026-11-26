@@ -38,9 +38,11 @@ pub enum Error {
         tensor: String,
         ty: GgmlType,
     },
-    /// `general.architecture` is not `qwen35`, `qwen35moe` or `flint`
+    /// `general.architecture` is not `qwen35`, `qwen35moe`, `flint` or
+    /// `inkling2_loop`
     UnsupportedArchitecture(String),
-    /// The tokenizer is not GPT-2 style BPE with the `qwen35` or `flint` pre-tokenizer
+    /// The tokenizer is not GPT-2 style BPE with the `qwen35`, `flint` or
+    /// `inkling2` pre-tokenizer
     UnsupportedTokenizer {
         model: String,
         pre: String,
@@ -95,13 +97,13 @@ impl fmt::Display for Error {
             Error::UnsupportedArchitecture(arch) => {
                 write!(
                     f,
-                    "unsupported architecture {arch} (expected qwen35, qwen35moe or flint)"
+                    "unsupported architecture {arch} (expected qwen35, qwen35moe, flint or inkling2_loop)"
                 )
             }
             Error::UnsupportedTokenizer { model, pre } => {
                 write!(
                     f,
-                    "unsupported tokenizer {model} / {pre} (expected gpt2 / qwen35 or flint)"
+                    "unsupported tokenizer {model} / {pre} (expected gpt2 / qwen35, flint or inkling2)"
                 )
             }
             Error::UnsupportedModel(what) => write!(f, "unsupported model: {what}"),

@@ -11,6 +11,8 @@ pub(crate) trait Float: Sized {
     fn powf(self, n: Self) -> Self;
     fn round(self) -> Self;
     fn sin_cos(self) -> (Self, Self);
+    fn tanh(self) -> Self;
+    fn ln(self) -> Self;
 }
 
 impl Float for f32 {
@@ -37,5 +39,13 @@ impl Float for f32 {
     #[inline]
     fn sin_cos(self) -> (f32, f32) {
         libm::sincosf(self)
+    }
+    #[inline]
+    fn tanh(self) -> f32 {
+        libm::tanhf(self)
+    }
+    #[inline]
+    fn ln(self) -> f32 {
+        libm::logf(self)
     }
 }

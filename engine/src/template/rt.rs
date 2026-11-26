@@ -313,7 +313,9 @@ fn py_float(f: f64, out: &mut String) {
         Some(m) => (true, m),
         None => (false, mantissa),
     };
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let mut digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let mut exp = exp;
+    even_tie(f.abs(), &mut digits, &mut exp);
     if neg {
         out.push('-');
     }
@@ -344,6 +346,54 @@ fn py_float(f: f64, out: &mut String) {
         }
         let _ = write!(out, "e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs());
     }
+}
+
+/// When `f` (positive) is exactly halfway between two shortest digit strings
+/// that round-trip, Python's `repr()` takes the one that ends in an even
+/// digit, and Rust's `{:e}` the larger: `digits` (no point, no trailing
+/// zeros) at `exp`, Rust's, become Python's
+fn even_tie(f: f64, digits: &mut String, exp: &mut i32) {
+    let n = digits.len();
+    // a tie's next digit is a 5, and the last
+    let near = format!("{f:.n$e}");
+    if !near.split_once('e').is_some_and(|(m, _)| m.ends_with('5')) {
+        return;
+    }
+    // exactly: a double's expansion has at most 767 significant digits
+    let exact = format!("{f:.800e}");
+    let (m, e) = exact.split_once('e').unwrap();
+    let all: String = m.chars().filter(|c| *c != '.').collect();
+    let all = all.trim_end_matches('0');
+    if all.len() != n + 1 || !all.ends_with('5') {
+        return;
+    }
+    let e: i32 = e.parse().unwrap();
+    // the two candidates, n digits each
+    let lo = (all[..n].to_string(), e);
+    let mut hi = all.as_bytes()[..n].to_vec();
+    let mut i = n;
+    while i > 0 && hi[i - 1] == b'9' {
+        hi[i - 1] = b'0';
+        i -= 1;
+    }
+    let hi = if i == 0 {
+        (format!("1{}", "0".repeat(n - 1)), e + 1)
+    } else {
+        hi[i - 1] += 1;
+        (String::from_utf8(hi).unwrap(), e)
+    };
+    let round_trips = |(d, e): &(String, i32)| format!("{d}e{}", e + 1 - n as i32).parse() == Ok(f);
+    if !round_trips(&lo) || !round_trips(&hi) {
+        return;
+    }
+    let (d, e) = if lo.0.as_bytes()[n - 1].is_multiple_of(2) {
+        lo
+    } else {
+        hi
+    };
+    // the first digit isn't a zero
+    *digits = d.trim_end_matches('0').into();
+    *exp = e;
 }
 
 /// `{{ v }}`
@@ -832,6 +882,47 @@ pub fn f_items(v: &Value) -> R {
     }
 }
 
+/// `dictsort`: a mapping's `(key, value)` pairs, by key, the case of
+/// string keys ignored unless `case_sensitive`, ties in their order
+pub fn f_dictsort(v: &Value, case_sensitive: &Value) -> R {
+    let mut pairs: Map = match v {
+        Value::Map(m) => m.as_ref().clone(),
+        Value::Ns(m) => m.borrow().clone(),
+        other => return err(format!("a {} has no items to sort", other.type_name())),
+    };
+    if truthy(case_sensitive) {
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    } else {
+        pairs.sort_by_cached_key(|p| p.0.to_lowercase());
+    }
+    Ok(Value::list(
+        pairs
+            .into_iter()
+            .map(|(k, x)| Value::list(vec![Value::data(&k), x]))
+            .collect(),
+    ))
+}
+
+/// `float`: a number as a float, a string parsed as one, else `default`
+/// (0.0)
+pub fn f_float(v: &Value, default: &Value) -> R {
+    let default = match default {
+        Value::Undefined => Value::Float(0.0),
+        d => d.clone(),
+    };
+    Ok(match v {
+        Value::Bool(b) => Value::Float(if *b { 1.0 } else { 0.0 }),
+        Value::Int(i) => Value::Float(*i as f64),
+        Value::Float(f) => Value::Float(*f),
+        Value::Str(s) => match s.text().trim_matches(is_py_space).parse::<f64>() {
+            Ok(f) => Value::Float(f),
+            Err(_) => default,
+        },
+        Value::Undefined => return err("float of an undefined value"),
+        _ => default,
+    })
+}
+
 pub fn f_replace(v: &Value, old: &Value, new: &Value) -> R {
     let s = to_str(v);
     let (old, new) = (to_str(old), to_str(new));
@@ -879,6 +970,23 @@ pub fn f_join(v: &Value, sep: &Value) -> R {
 /// `tojson`, as transformers' chat templates have it: `json.dumps` with
 /// `ensure_ascii=False`, `sort_keys=False` by default
 pub fn f_tojson(v: &Value, ensure_ascii: &Value, indent: &Value, sort_keys: &Value) -> R {
+    // Python's default separators
+    let item_sep = match indent {
+        Value::Undefined | Value::None => ", ",
+        _ => ",",
+    };
+    f_tojson_sep(v, ensure_ascii, indent, sort_keys, item_sep, ": ")
+}
+
+/// [`f_tojson`] with `separators=(item_sep, key_sep)`
+pub fn f_tojson_sep(
+    v: &Value,
+    ensure_ascii: &Value,
+    indent: &Value,
+    sort_keys: &Value,
+    item_sep: &str,
+    key_sep: &str,
+) -> R {
     let indent = match indent {
         Value::Undefined | Value::None => None,
         Value::Int(i) => Some(*i.max(&0) as usize),
@@ -894,15 +1002,20 @@ pub fn f_tojson(v: &Value, ensure_ascii: &Value, indent: &Value, sort_keys: &Val
         ensure_ascii: truthy(ensure_ascii),
         indent,
         sort_keys: truthy(sort_keys),
+        item_sep,
+        key_sep,
     };
     json_into(v, &opts, 0, &mut out)?;
     Ok(Value::data(&out))
 }
 
-struct JsonOpts {
+struct JsonOpts<'a> {
     ensure_ascii: bool,
     indent: Option<usize>,
     sort_keys: bool,
+    /// between items, and between a key and its value
+    item_sep: &'a str,
+    key_sep: &'a str,
 }
 
 fn json_into(v: &Value, o: &JsonOpts, depth: usize, out: &mut String) -> R<()> {
@@ -914,7 +1027,6 @@ fn json_into(v: &Value, o: &JsonOpts, depth: usize, out: &mut String) -> R<()> {
             }
         }
     };
-    let item_sep = if o.indent.is_some() { "," } else { ", " };
     match v {
         Value::None => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -935,7 +1047,7 @@ fn json_into(v: &Value, o: &JsonOpts, depth: usize, out: &mut String) -> R<()> {
             out.push('[');
             for (i, x) in l.iter().enumerate() {
                 if i > 0 {
-                    out.push_str(item_sep);
+                    out.push_str(o.item_sep);
                 }
                 newline(out, depth + 1);
                 json_into(x, o, depth + 1, out)?;
@@ -962,7 +1074,7 @@ fn json_map(m: &Map, o: &JsonOpts, depth: usize, out: &mut String) -> R<()> {
     out.push('{');
     for (i, (k, x)) in entries.into_iter().enumerate() {
         if i > 0 {
-            out.push_str(if o.indent.is_some() { "," } else { ", " });
+            out.push_str(o.item_sep);
         }
         if let Some(n) = o.indent {
             out.push('\n');
@@ -971,7 +1083,7 @@ fn json_map(m: &Map, o: &JsonOpts, depth: usize, out: &mut String) -> R<()> {
             }
         }
         json_string(k, o.ensure_ascii, out);
-        out.push_str(": ");
+        out.push_str(o.key_sep);
         json_into(x, o, depth + 1, out)?;
     }
     if let Some(n) = o.indent {
@@ -1237,6 +1349,9 @@ pub struct Message {
     pub reasoning_content: Option<String>,
     /// an answer's function calls
     pub tool_calls: Vec<ToolCall>,
+    /// who wrote it: the function a tool's result is of, as the template
+    /// writes it. Not in `messages` when `None`.
+    pub name: Option<String>,
 }
 
 impl Message {
@@ -1246,6 +1361,7 @@ impl Message {
             content: Content::Text(text.to_owned()),
             reasoning_content: None,
             tool_calls: Vec::new(),
+            name: None,
         }
     }
 }
@@ -1266,8 +1382,9 @@ pub fn json(j: &Json) -> Value {
 }
 
 /// `messages`, in transformers' shape: `{"role", "content",
-/// "reasoning_content", "tool_calls": [{"type": "function", "function":
-/// {"name", "arguments"}}]}`, the last two only when there are some
+/// "reasoning_content", "name", "tool_calls": [{"type": "function",
+/// "function": {"name", "arguments"}}]}`, the last three only when there are
+/// some
 pub fn messages(messages: &[Message]) -> Value {
     Value::list(
         messages
@@ -1295,6 +1412,9 @@ pub fn messages(messages: &[Message]) -> Value {
                 e.push(("content".into(), content));
                 if let Some(r) = &m.reasoning_content {
                     e.push(("reasoning_content".into(), Value::data(r)));
+                }
+                if let Some(n) = &m.name {
+                    e.push(("name".into(), Value::data(n)));
                 }
                 if !m.tool_calls.is_empty() {
                     let calls = m

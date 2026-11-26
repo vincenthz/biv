@@ -10,7 +10,7 @@
 
 use crate::Error;
 use crate::gguf::{Gguf, tensor};
-use crate::model::{Config, DRAFT_CAP};
+use crate::model::{Config, DRAFT_CAP, InklingConfig};
 use crate::prelude::*;
 
 /// The memory of a model, without its sessions
@@ -54,6 +54,9 @@ impl ModelMemory {
 
 /// The f32 values the model converts its small tensors to
 fn params(c: &Config, has_mtp: bool) -> usize {
+    if let Some(ink) = &c.inkling {
+        return inkling_params(c, ink);
+    }
     let e = c.n_embd;
     let sinks = if c.attn_sinks { c.n_head } else { 0 };
     let attention = 2 * e + 2 * c.head_dim + sinks;
@@ -67,6 +70,35 @@ fn params(c: &Config, has_mtp: bool) -> usize {
     let mtp = if has_mtp { 3 * e + attention } else { 0 };
     // output norm, rope frequencies
     layers + mtp + e + c.n_rot / 2
+}
+
+/// [`params`] of `inkling2_loop`: the norms, depth mix queries, clip
+/// scales, bias tables, conv taps and router biases of each layer, and the
+/// message queries of the looped ones
+fn inkling_params(c: &Config, ink: &InklingConfig) -> usize {
+    let (e, kv_dim, k) = (c.n_embd, c.kv_dim(), ink.conv);
+    let n_expert = c.moe.as_ref().map_or(0, |m| m.n_expert);
+    let layers: usize = (0..c.n_layer)
+        .map(|i| {
+            let swa = c.is_swa(i);
+            let (ext, inputs) = match swa {
+                true => (c.sliding_window, 1),
+                false => (ink.rel_extent, 3),
+            };
+            // the mix queries of the attention inputs and their norms
+            let query = if i > 0 { inputs * e } else { 0 };
+            let attn = query
+                + inputs * e
+                + c.n_head * (c.head_dim + ink.n_rel)
+                + ext * ink.n_rel
+                + 2 * kv_dim * k
+                + 2 * e * k;
+            let looped = (ink.loop_start..ink.loop_end).contains(&i) && ink.loop_count > 1;
+            attn + 2 * e + n_expert + if looped { 4 * e } else { 0 }
+        })
+        .sum();
+    // embeddings norm, output mix query, output norm
+    layers + 3 * e
 }
 
 /// The memory of a session, by what holds it
@@ -184,6 +216,9 @@ impl Shape<'_> {
     /// `context` tokens, drafting when `draft` > 0, and what its passes of
     /// `batch` tokens allocate
     pub(crate) fn cpu_session(&self, context: usize, draft: usize, batch: usize) -> SessionMemory {
+        if let Some(ink) = &self.cfg.inkling {
+            return self.inkling_cpu_session(ink, context, draft, batch);
+        }
         let c = self.cfg;
         let (e, kv_dim) = (c.n_embd, self.kv_dim());
         let mtp = draft > 0 && self.has_mtp;
@@ -220,6 +255,79 @@ impl Shape<'_> {
             scratch: if mtp { 4 * e } else { 0 },
             transient: saved + activations + logits,
             kv_per_token: attention * 2 * 4 * kv_dim,
+        }
+    }
+}
+
+impl Shape<'_> {
+    /// [`Shape::cpu_session`] of `inkling2_loop`: a slot per layer visit,
+    /// each with kv caches (a ring on sliding window layers) and a conv state
+    fn inkling_cpu_session(
+        &self,
+        ink: &InklingConfig,
+        context: usize,
+        draft: usize,
+        batch: usize,
+    ) -> SessionMemory {
+        let c = self.cfg;
+        let (e, kv_dim) = (c.n_embd, self.kv_dim());
+        let n_slot = ink.n_slot(c.n_layer);
+        let full = (0..n_slot)
+            .filter(|&s| !c.is_swa(ink.layer_of(s, c.n_layer)))
+            .count();
+        let window = (n_slot - full) * 2 * 4 * c.cpu_ring(context, draft) * kv_dim;
+        let conv = 4 * (ink.conv - 1) * ink.conv_channels(kv_dim, e);
+
+        // a verify pass keeps the conv inputs of its tokens after the state's
+        // rows, `inkling::short_conv`, in each slot
+        let hist = ink.conv - 1;
+        let saved = match draft {
+            0 => 0,
+            _ => 4 * n_slot * (hist + draft + 1) * ink.conv_channels(kv_dim, e),
+        };
+        // per token, what a pass holds throughout: the stream, the prelude's
+        // output, the previous pass's normalized one, the normalized blocks
+        // and the messages of a looped layer
+        let n = batch.max(draft + 1);
+        let blocks = (0..n_slot)
+            .filter(|&s| ink.layer_of(s, c.n_layer).is_multiple_of(ink.block))
+            .count();
+        let stream = (3 + blocks + 4) * e;
+        // and the largest of a layer's steps, `inkling::ink_layer`: the
+        // activations quantized for a matmul take 40 bytes per 32 values
+        let q8 = |f: usize| f.div_ceil(32) * 10;
+        let (qd, nh, r) = (c.n_head * c.head_dim, c.n_head, ink.gate_rank);
+        // a controller: its input pair, bottleneck and output
+        let control = 2 * e + q8(2 * e) + r + q8(r) + e;
+        // the normalized stream and three attention inputs, with the
+        // controllers of all three at once; then their projections; then
+        // (smaller) the convs and the attention
+        let inputs = 4 * e + 3 * control;
+        let projections = 4 * e
+            + 3 * q8(e)
+            + 2 * qd
+            + 2 * kv_dim
+            + nh * (ink.n_rel + 1)
+            + 2 * c.n_head_kv * ink.conv;
+        // the feed-forward input, the router logits, the chosen experts'
+        // SITU outputs and their quantization, their outputs (in a pass of
+        // few tokens per expert, `inkling::cpu::experts`), and the output
+        let experts = c.moe.as_ref().map_or(0, |m| {
+            let (k, ff) = (m.n_expert_used, m.n_ff_exp);
+            2 * e + q8(e) + m.n_expert + k * ff + q8(k * ff) + k * e
+        });
+        let layer = inputs.max(projections).max(2 * e + control).max(experts);
+        let activations = 4 * n * (stream + layer);
+        // the logits of a verify pass, and their copy per token
+        let logits = 2 * 4 * (draft + 1) * c.n_vocab;
+
+        SessionMemory {
+            kv: full * 2 * 4 * context.saturating_mul(kv_dim),
+            recurrent: n_slot * conv + window,
+            draft_head: 0,
+            scratch: 0,
+            transient: saved + activations + logits,
+            kv_per_token: full * 2 * 4 * kv_dim,
         }
     }
 }
@@ -277,10 +385,26 @@ impl Footprint {
         }
     }
 
+    /// Whether `backend` runs the model: `inkling2_loop` runs on the CPU, and
+    /// on Metal when its kernels take the model's geometry
+    pub fn supports(&self, backend: Backend) -> bool {
+        match backend {
+            Backend::Cpu { .. } => true,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal { .. } => crate::metal::supports(&self.cfg),
+            #[cfg(feature = "cuda")]
+            Backend::Cuda { .. } => self.cfg.inkling.is_none(),
+        }
+    }
+
     /// What a session on `backend` takes, created by
     /// [`Engine::new_session`](crate::engine::Engine::new_session) with
-    /// `context` and `draft`
+    /// `context` and `draft`; nothing when the backend doesn't run the model
+    /// ([`Footprint::supports`]), its engine then failing to be created
     pub fn session(&self, backend: Backend, context: usize, draft: usize) -> SessionMemory {
+        if !self.supports(backend) {
+            return SessionMemory::default();
+        }
         match backend {
             Backend::Cpu { batch } => self.shape().cpu_session(context, draft, batch),
             #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -292,8 +416,12 @@ impl Footprint {
 
     /// The longest context whose session, with the model, fits in `budget`
     /// bytes at its peak: weights included, the MTP head's when drafting.
-    /// None when even an empty context doesn't fit.
+    /// None when even an empty context doesn't fit, or the backend doesn't
+    /// run the model.
     pub fn max_context(&self, backend: Backend, draft: usize, budget: usize) -> Option<usize> {
+        if !self.supports(backend) {
+            return None;
+        }
         let m = self.model(backend);
         let model = m.weights + m.params + if draft > 0 { m.mtp_weights } else { 0 };
         let fits = |context| model + self.session(backend, context, draft).peak() <= budget;
