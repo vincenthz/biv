@@ -194,4 +194,17 @@ fn main() {
             }
         }
     }
+
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    {
+        let cuda = Backend::Cuda { max_batch: 256 };
+        let e = biv::cuda::CudaEngine::new(&model, 256).unwrap();
+        assert_eq!(e.model_memory(), f.model(cuda));
+        println!("cuda: the engine has the estimated model memory");
+        for &c in &contexts {
+            for draft in [0, 4] {
+                check("cuda", &e, f.session(cuda, c, draft), c, draft);
+            }
+        }
+    }
 }

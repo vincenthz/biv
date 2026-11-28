@@ -1866,3 +1866,6 @@ extern "C" __global__ void moe_combine(const CombineArgs a) {
     }
     ((float *) a.x)[(size_t) t * a.n_embd + d] += acc;
 }
+
+// inkling2_loop
+#include "inkling.cu"

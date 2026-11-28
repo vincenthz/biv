@@ -386,14 +386,14 @@ impl Footprint {
     }
 
     /// Whether `backend` runs the model: `inkling2_loop` runs on the CPU, and
-    /// on Metal when its kernels take the model's geometry
+    /// on Metal and CUDA when their kernels take the model's geometry
     pub fn supports(&self, backend: Backend) -> bool {
         match backend {
             Backend::Cpu { .. } => true,
             #[cfg(all(feature = "metal", target_os = "macos"))]
             Backend::Metal { .. } => crate::metal::supports(&self.cfg),
             #[cfg(feature = "cuda")]
-            Backend::Cuda { .. } => self.cfg.inkling.is_none(),
+            Backend::Cuda { .. } => crate::cuda::supports(&self.cfg),
         }
     }
 

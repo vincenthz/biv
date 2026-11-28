@@ -18,7 +18,7 @@ Models architecture supported:
 * qwen35 (supported Qwen3.8-27B, Qwen3.5-4B)
 * qwen35moe (supported Qwen3.6-35B-A3B)
 * flint
-* inkling2_loop (supported Inkling-2-Mini; Metal and CPU only)
+* inkling2_loop (supported Inkling-2-Mini)
 
 Note: It might support other models that use those model architectures.
 
@@ -81,8 +81,7 @@ pinned host memory that the GPU reads across the bus, so models larger than
 the GPU run, at the speed of the bus for that part. The token embeddings stay
 on the host. KV caches are f16, as on Metal.
 
-Not yet on CUDA: the `inkling2_loop` architecture (Inkling-2 runs on Metal and
-the CPU, `--cpu`), drafting with the MTP head (`--draft` gives the room to
+Not yet on CUDA: drafting with the MTP head (`--draft` gives the room to
 verify, `--lookup` works), sequences batched in one pass (they run one after
 another), and tuned kernels: decode reads the weights at about half the
 memory bandwidth, prefill uses no tensor cores. On an RTX 5080 (16 GB, PCIe 5),
@@ -94,6 +93,10 @@ with `examples/compare.rs` (2 GB left for the session):
 | Qwen3.8-27B Q4_1 | 13.0 / 3.5 GB | 1.8 s | 8.1 tok/s |
 | Qwen3.6-35B-A3B Q8_0 | 13.0 / 23.4 GB | 0.9 s | 21 tok/s |
 | Flint Q8_0 | 12.9 / 29.1 GB | 1.0 s | 24 tok/s |
+| Inkling-2-Mini Q8_0 | 12.2 / 15.2 GB | 0.48 s | 16 tok/s |
+
+Inkling-2-Mini's core layers run three times per token, so their experts go to
+the GPU first; it prefills 512 tokens at 889 tok/s (`examples/inkperf.rs`).
 
 The CLI leaves only what its session takes: with a 16k context, 13.7 GB of the
 27B go to the GPU, and it decodes at 10.5 tok/s.
@@ -158,7 +161,7 @@ whose pre-tokenizer splits words on case changes (`parseHttp` is `parse`,
 [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 (`inkling2_loop`: 24 layers, the middle 12 run three times; 128 experts with
 sigmoid routing, 8 per token; sliding window attention over 1024 positions,
-full attention every sixth layer, no rope; Metal and the CPU, not yet CUDA):
+full attention every sixth layer, no rope; Metal, CUDA and the CPU):
 
 ```sh
 hf download ggml-org/Inkling-2-Mini-GGUF Inkling-2-Mini-Q8_0.gguf   # 27.8 GB
@@ -313,6 +316,7 @@ time either way (cpuid). Its features:
 | `engine/src/metal/inkling.rs`, `inkling.metal` | `inkling2_loop` on Metal: its passes, slots and kernels (depth mix, controllers, convs, split-K and flash attention with relative positions, fused q8_0 expert matvecs) |
 | `engine/src/cuda/mod.rs` | CUDA backend: weight placement (device, then mapped host memory), per-sequence KV/recurrent state, the kernel launches of a forward pass |
 | `engine/src/cuda/kernels.cu` | matvec / matmul per quant type (32-value units dequantized per lane), the same over each expert's pairs, norm, rope + cache write, attention (online softmax, sinks, rings), conv and gated delta-net, expert routing, sorting and combining |
+| `engine/src/cuda/inkling.rs`, `inkling.cu` | `inkling2_loop` on CUDA: its passes, slots and kernels (depth mix, controllers, convs, split-K attention with relative positions, SITU), the core's experts placed on the device first |
 | `engine/src/cuda/driver.rs` | the CUDA driver API, loaded at run time; device and mapped host buffers |
 | `engine/build.rs` | with `cuda`: the kernels compiled by cudaforge / nvcc to PTX, assembled by ptxas |
 | `engine/src/tokenizer.rs` | byte-level BPE; the `qwen35`, `flint` and `inkling2` (o200k) pre-tokenizer regexes, matched by hand |
@@ -517,14 +521,17 @@ chats, `ChatOptions::draft` at 0 or 1 is faster.
   alone. Inkling-2-Mini on Metal: the same top-1 token at every compared
   position, max differences of 1–3.4 (6.8 in the decode steps of a batch of
   2: each pass size runs other kernels, and a near tie picks other experts),
-  a restored snapshot exact.
-- `examples/reflogits.rs <gguf> <ref> [--mode M] [--metal]`: logits against
+  a restored snapshot exact. On CUDA: passes of 64 the same as of 256,
+  differences of 2.4–4.5 for passes of 31, 7 and 1 and 8.2 for verify + keep
+  against decode, the same top-1 token everywhere, a restored snapshot exact.
+- `examples/reflogits.rs <gguf> <ref> [--mode M] [--gpu]`: logits against
   reference logits of the same token ids (llama.cpp's `llama-results`,
   converted to raw files), per position and in distribution: top-1 agreement,
   max difference, KL. Inkling-2-Mini against llama.cpp's CPU on 396 and 1852
   tokens: top-1 97.3–97.7% and KL 4.7e-3–7.8e-3 on the CPU, 96.0–97.7% and
-  5.3e-3–6.1e-3 on Metal, where llama.cpp against itself with another batch
-  size gives 97.4–97.7% and 4.5e-3–5.3e-3.
+  5.3e-3–6.1e-3 on Metal, 96.5–97.5% and 4.3e-3–8.7e-3 on CUDA (decode
+  steps, verify passes of 8 and 64), where llama.cpp against itself with
+  another batch size gives 97.4–97.7% and 4.5e-3–5.3e-3.
 - `examples/inkperf.rs <gguf> [--cpu] [-c N] [-n M]`: prefill and decode
   rates at a context.
 

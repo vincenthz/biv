@@ -18,7 +18,7 @@
 
 use super::*;
 use crate::model::InklingConfig;
-use crate::model::inkling::{InkLayer, Inkling, Visit};
+use crate::model::inkling::{InkLayer, Inkling, MIX_EPS, StackPlan, Visit};
 
 /// The taps of the short convs the kernel takes
 const CONV_TAPS: usize = 4;
@@ -233,53 +233,6 @@ pub(super) struct GpuInkling {
     /// simdgroups of the `ink_attn_split` kernel of the model's group
     split_nsg: usize,
     stack: StackPlan,
-}
-
-/// Where the blocks of the stream go in [`InkScratch::stack`], in regions of
-/// a pass's rows: the prelude's, the core's by the parity of the pass, the
-/// epilogue's, then the normalized stream and the previous pass's output
-#[derive(Clone, Copy)]
-struct StackPlan {
-    prelude: usize,
-    core: usize,
-    epilogue: usize,
-}
-
-impl StackPlan {
-    fn new(ink: &InklingConfig, n_layer: usize) -> Self {
-        let blocks = |r: core::ops::Range<usize>| r.filter(|i| i.is_multiple_of(ink.block)).count();
-        StackPlan {
-            prelude: blocks(0..ink.loop_start),
-            core: blocks(ink.loop_start..ink.loop_end),
-            epilogue: blocks(ink.loop_end..n_layer),
-        }
-    }
-
-    fn regions(&self) -> usize {
-        self.prelude + 2 * self.core + self.epilogue + 2
-    }
-
-    /// The normalized stream of the visit
-    fn cur(&self) -> usize {
-        self.regions() - 2
-    }
-
-    /// The previous pass's normalized output
-    fn bank_out(&self) -> usize {
-        self.regions() - 1
-    }
-
-    /// The region of the `j`-th block pushed by a visit of pass `pass` of
-    /// layer `layer`
-    fn push(&self, ink: &InklingConfig, layer: usize, pass: usize, j: usize) -> usize {
-        if layer < ink.loop_start {
-            j
-        } else if layer < ink.loop_end {
-            self.prelude + (pass % 2) * self.core + j
-        } else {
-            self.prelude + 2 * self.core + j
-        }
-    }
 }
 
 fn upload_all(device: &Device, parts: &[&[f32]]) -> Result<Buffer, Error> {
@@ -1916,9 +1869,6 @@ impl MetalEngine<'_> {
     }
 }
 
-/// See `MIX_EPS` of [`crate::model::inkling`]
-const MIX_EPS: f32 = 1e-6;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2012,44 +1962,5 @@ mod tests {
         let mut c = mini_config();
         c.head_dim = 64;
         assert!(!ok(&c));
-    }
-
-    #[test]
-    fn stack_regions_of_the_blocks_are_distinct() {
-        let ink = mini();
-        let plan = StackPlan::new(&ink, 24);
-        assert_eq!((plan.prelude, plan.core, plan.epilogue), (1, 2, 1));
-        assert_eq!(plan.regions(), 8);
-        // the blocks pushed by a pass, in visit order
-        let pushes = |pass: usize| -> Vec<usize> {
-            let mut j = 0;
-            let mut out = Vec::new();
-            for v in ink.visits(24).iter().filter(|v| v.pass == pass) {
-                if v.layer.is_multiple_of(ink.block) {
-                    let phase_start = matches!(v.layer, 0 | 6 | 18);
-                    if phase_start {
-                        j = 0;
-                    }
-                    out.push(plan.push(&ink, v.layer, v.pass, j));
-                    j += 1;
-                }
-            }
-            out
-        };
-        // the prelude's and the epilogue's (pass 0), the core's by parity
-        assert_eq!(pushes(0), [0, 1, 2, 5]);
-        assert_eq!(pushes(1), [3, 4]);
-        assert_eq!(pushes(2), [1, 2]);
-        // the stream and the bank's output after every block
-        assert_eq!((plan.cur(), plan.bank_out()), (6, 7));
-        // a pass's core blocks never overwrite the previous pass's (its bank)
-        for pass in 1..ink.loop_count {
-            let (now, before) = (pushes(pass), pushes(pass - 1));
-            let before: Vec<usize> = before
-                .into_iter()
-                .filter(|&r| (1..5).contains(&r))
-                .collect();
-            assert!(now.iter().all(|r| !before.contains(r)), "pass {pass}");
-        }
     }
 }

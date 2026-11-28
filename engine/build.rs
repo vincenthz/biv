@@ -23,6 +23,8 @@ fn cuda() -> Result<(), Box<dyn std::error::Error>> {
     cudaforge::KernelBuilder::new()
         .compute_cap_arch(&arch.to_string())
         .source_files(["src/cuda/kernels.cu"])
+        // included by kernels.cu
+        .watch(["src/cuda/inkling.cu"])
         .arg("-O3")
         .arg("-std=c++17")
         .arg("-lineinfo")

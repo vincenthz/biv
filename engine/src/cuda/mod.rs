@@ -9,10 +9,13 @@
 //! memory runs, at the speed of the bus for that part. The token embeddings
 //! stay on the host: a pass looks up its tokens' rows on the CPU.
 //!
+//! `inkling2_loop` runs through its own passes, in `inkling.rs`.
+//!
 //! Not yet: the MTP head (sessions verify but don't draft) and batched
 //! sequences (a [`Batch`](crate::engine::Batch) runs them one after another).
 
 mod driver;
+mod inkling;
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -34,6 +37,14 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels.ptx"));
 /// The kernels assembled for [`ARCH`], the GPU of the build
 const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.cubin"));
 const ARCH: &str = env!("BIV_CUDA_ARCH");
+
+/// Whether the engine runs the model: all but the `inkling2_loop` models
+/// whose geometry the kernels don't take
+pub(crate) fn supports(c: &Config) -> bool {
+    c.inkling
+        .as_ref()
+        .is_none_or(|ink| inkling::check(c, ink).is_ok())
+}
 
 /// Device memory [`CudaEngine::new`] leaves for the sessions
 pub const DEFAULT_RESERVE: usize = 2 << 30;
@@ -286,6 +297,7 @@ struct Kernels {
     moe_route: Func,
     moe_sort: Func,
     moe_combine: Func,
+    ink: inkling::InkKernels,
 }
 
 impl Kernels {
@@ -354,6 +366,7 @@ impl Kernels {
             moe_route: f("moe_route")?,
             moe_sort: f("moe_sort")?,
             moe_combine: f("moe_combine")?,
+            ink: inkling::InkKernels::load(&f)?,
         })
     }
 }
@@ -510,6 +523,9 @@ fn largest_ffn(model: &Model<'_>) -> (usize, usize) {
     let w = |w: &Weight<'_>| w.rows * device_row_bytes(w.ty, w.cols);
     let x = |x: &Experts<'_>| x.data.len() / x.row_bytes() * device_row_bytes(x.ty, x.cols);
     let (mut dense, mut experts) = (0, 0);
+    if let Some(m) = &model.inkling {
+        experts = inkling::largest_experts(m);
+    }
     for l in &model.layers {
         match &l.ffn {
             Ffn::Dense { gate, up, down } => dense = dense.max(w(gate).max(w(up)).max(w(down))),
@@ -770,6 +786,8 @@ pub struct CudaEngine<'m> {
     stage: Option<Stage>,
     max_batch: usize,
     name: String,
+    /// the layers of `inkling2_loop` (then `layers` is empty)
+    ink: Option<inkling::GpuInkling>,
     /// bytes of weights on the device, and in mapped host memory
     weights_device: usize,
     weights_host: usize,
@@ -818,10 +836,8 @@ impl<'m> CudaEngine<'m> {
         reserve: usize,
     ) -> Result<Self, Error> {
         let c = &model.cfg;
-        if c.inkling.is_some() {
-            return Err(backend(
-                "cuda: inkling2_loop is not supported on this backend yet (use the cpu)",
-            ));
+        if let Some(ink) = &c.inkling {
+            inkling::check(c, ink)?;
         }
         if c.recurrent.contains(&true) && (c.ssm_state != SD || c.conv_kernel != 4) {
             return Err(backend(
@@ -872,13 +888,13 @@ impl<'m> CudaEngine<'m> {
             p
         };
         let mut dry = placer(true, None);
-        Self::place(model, &mut dry)?;
+        Self::place_all(model, &mut dry)?;
         let arena = match dry.host {
             0 => None,
             n => Buf::mapped_uninit(n).ok().map(|b| (Arc::new(b), 0)),
         };
         let mut placer = placer(false, arena);
-        let (output, layers) = Self::place(model, &mut placer)?;
+        let (output, layers, ink) = Self::place_all(model, &mut placer)?;
         // what the arena holds more (a tensor that didn't fit the device after
         // all) is in its own memory
         placer.arena = None;
@@ -888,6 +904,7 @@ impl<'m> CudaEngine<'m> {
             inv_freq: Buf::from_f32(&model.inv_freq)?,
             output,
             layers,
+            ink,
             name: d.name(),
 
             // without the room, the matmuls read host memory as they go
@@ -918,6 +935,24 @@ impl<'m> CudaEngine<'m> {
             k,
             max_batch: max_batch.max(1),
         })
+    }
+
+    /// [`CudaEngine::place`], or the layers of `inkling2_loop`
+    #[allow(clippy::type_complexity)]
+    fn place_all(
+        model: &Model<'_>,
+        placer: &mut Placer,
+    ) -> Result<(GpuWeight, Vec<GpuLayer>, Option<inkling::GpuInkling>), Error> {
+        match &model.inkling {
+            Some(m) => {
+                let (output, ink) = inkling::place(model, m, placer)?;
+                Ok((output, Vec::new(), Some(ink)))
+            }
+            None => {
+                let (output, layers) = Self::place(model, placer)?;
+                Ok((output, layers, None))
+            }
+        }
     }
 
     /// The model's weights through `placer`, in the order of their priority
@@ -1507,7 +1542,7 @@ impl Shape<'_> {
         if let Some(moe) = moe_bytes(c, b) {
             bytes += moe.iter().sum::<usize>();
         }
-        bytes
+        bytes + inkling::scratch_bytes(c, b).iter().sum::<usize>()
     }
 
     /// What [`CudaEngine::new_session`](Engine::new_session) allocates
@@ -1518,6 +1553,9 @@ impl Shape<'_> {
         max_batch: usize,
     ) -> SessionMemory {
         let c = self.cfg;
+        if let Some(ink) = &c.inkling {
+            return self.inkling_cuda_session(ink, context, draft, max_batch);
+        }
         let b = max_batch.max(1);
         let slots = self.cuda_draft(draft, b) + 1;
         let attention = self.attention_layers();
@@ -1567,6 +1605,8 @@ struct Scratch {
     /// int8 inputs: of the normalized hidden states `h`, of the others
     q8: [Q8Buf; 2],
     moe: Option<MoeScratch>,
+    /// `inkling2_loop`'s own buffers
+    ink: Option<inkling::InkScratch>,
 }
 
 /// Int8 activations, see `quantize_q8`
@@ -1690,6 +1730,7 @@ impl Scratch {
             logits: logits?,
             q8: [Q8Buf { q: q0?, ds: ds0? }, Q8Buf { q: q1?, ds: ds1? }],
             moe,
+            ink: inkling::InkScratch::new(c, b)?,
         })
     }
 }
@@ -1724,6 +1765,8 @@ fn window_rows(c: &Config, i: usize, n_past: usize) -> usize {
 struct CudaSession<'e> {
     e: &'e CudaEngine<'e>,
     layers: Vec<LayerState>,
+    /// the slots of `inkling2_loop` (then `layers` is empty)
+    ink: Vec<inkling::InkSlot>,
     s: Scratch,
     /// copies of the delta net states (one more than the draft length), and
     /// the current one
@@ -1758,8 +1801,13 @@ impl<'e> CudaSession<'e> {
         let ring = shape.cuda_ring(context, b);
         let window_bytes = shape.cuda_window_bytes(context, b);
         let kv = kv_bytes(context, shape.kv_dim());
-        let mut layers = Vec::with_capacity(c.n_layer);
-        for (i, &r) in c.recurrent.iter().enumerate() {
+        // the slots of inkling2_loop instead of its layers'
+        let (ink, n_layers) = match c.inkling {
+            Some(_) => (inkling::new_slots(c, &shape, context, slots, b)?, 0),
+            None => (Vec::new(), c.n_layer),
+        };
+        let mut layers = Vec::with_capacity(n_layers);
+        for (i, &r) in c.recurrent.iter().enumerate().take(n_layers) {
             layers.push(if r {
                 LayerState::DeltaNet {
                     conv: Buf::zeroed(slots * 4 * conv)?,
@@ -1789,11 +1837,13 @@ impl<'e> CudaSession<'e> {
                     LayerState::DeltaNet { conv, s } => conv.bytes + s.bytes,
                 })
                 .sum::<usize>()
+                + ink.iter().map(inkling::InkSlot::bytes).sum::<usize>()
                 + shape.cuda_scratch(b, slots)
         );
         Ok(CudaSession {
             e,
             layers,
+            ink,
             s,
             slots,
             slot: 0,
@@ -1903,7 +1953,7 @@ impl<'e> CudaSession<'e> {
                         .capture(|| {
                             px.upload(0, 4 * n * emb, s.x.ptr);
                             pp.upload(0, size_of::<PassParams>(), params);
-                            e.encode_pass(s, &self.layers, n, rows, params, slots, save);
+                            e.encode_pass(s, &self.layers, &self.ink, n, rows, params, slots, save);
                             pl.download(0, 4 * rows * c.n_vocab, s.logits.ptr);
                         })
                         .unwrap_or_else(|err| panic!("{err}"));
@@ -1921,8 +1971,18 @@ impl<'e> CudaSession<'e> {
             s.x.write(0, f32_bytes(&x));
             self.params.write(0, params_bytes);
             let params = self.params.ptr;
-            self.stream
-                .run(|| e.encode_pass(s, &self.layers, n, rows, params, self.slots, save));
+            self.stream.run(|| {
+                e.encode_pass(
+                    s,
+                    &self.layers,
+                    &self.ink,
+                    n,
+                    rows,
+                    params,
+                    self.slots,
+                    save,
+                )
+            });
             e.d.sync();
             if rows > 0 {
                 let all = s.logits.read_f32(0, rows * c.n_vocab);
@@ -1940,6 +2000,9 @@ impl<'e> CudaSession<'e> {
     }
 
     fn snapshot(&self) -> Result<Snapshot, Error> {
+        if self.e.ink.is_some() {
+            return self.ink_snapshot();
+        }
         assert!(
             self.verify_from.is_none(),
             "snapshot between verify and keep"
@@ -1994,6 +2057,9 @@ impl<'e> CudaSession<'e> {
     }
 
     fn restore(&mut self, snapshot: &Snapshot) -> Result<(), Error> {
+        if self.e.ink.is_some() {
+            return self.ink_restore(snapshot);
+        }
         let snap: &CudaSnapshot = snapshot.data()?;
         let n_past = snapshot.n_past();
         if n_past > self.context {
@@ -2064,19 +2130,24 @@ impl CudaEngine<'_> {
         (4 * conv, 4 * s)
     }
 
-    /// A pass of the `n` embeddings in `s.x` through the layers, and the
-    /// logits of its last `rows` into `s.logits`
+    /// A pass of the `n` embeddings in `s.x` through the layers (or the
+    /// slots of `inkling2_loop`, `ink`), and the logits of its last `rows`
+    /// into `s.logits`
     #[allow(clippy::too_many_arguments)]
     fn encode_pass(
         &self,
         s: &Scratch,
         layers: &[LayerState],
+        ink: &[inkling::InkSlot],
         n: usize,
         rows: usize,
         params: DevPtr,
         slots: usize,
         save: bool,
     ) {
+        if let Some(m) = &self.ink {
+            return self.ink_pass(m, s, ink, n, rows, params, slots, save);
+        }
         let c = self.cfg();
         let emb = c.n_embd;
         self.stage_begin();
@@ -2317,7 +2388,58 @@ impl CudaEngine<'_> {
         let c = self.cfg();
         let mc = c.moe.as_ref().expect("a moe config");
         let ms = s.moe.as_ref().expect("the moe buffers");
-        let (emb, k, ne) = (c.n_embd, mc.n_expert_used, mc.n_expert);
+        let (emb, k) = (c.n_embd, mc.n_expert_used);
+        let pairs = n * k;
+        let (tiles, mma) = self.route(s, m, h);
+        let ff = mc.n_ff_exp;
+        self.matmul_id(&m.gate, ms, h, k, tiles, mma, ms.a1.ptr);
+        self.matmul_id(&m.up, ms, h, k, tiles, mma, ms.a2.ptr);
+        self.elementwise(self.k.swiglu, ms.a1.ptr, ms.a2.ptr, pairs * ff);
+        let a = Act::new(ms.a1.ptr, pairs, ff, &s.q8[1]);
+        self.matmul_id(&m.down, ms, &a, 1, tiles, mma, ms.out.ptr);
+
+        let mode = match &m.shared {
+            Some(sh) => {
+                self.dense_ffn(s, &sh.gate, &sh.up, &sh.down, h, ms.shared.ptr);
+                match &sh.gate_inp {
+                    Some(g) => {
+                        self.matmul(g, h, ms.gate.ptr);
+                        1
+                    }
+                    None => 2,
+                }
+            }
+            None => 0,
+        };
+        let args = CombineArgs {
+            x: s.x.ptr,
+            out: ms.out.ptr,
+            weights: ms.weights.ptr,
+            shared: ms.shared.ptr,
+            gate: ms.gate.ptr,
+            n_embd: emb as i32,
+            k: k as i32,
+            mode,
+            pad: 0,
+        };
+        self.d.launch(
+            self.k.moe_combine,
+            [emb.div_ceil(256) as u32, n as u32, 1],
+            [256, 1, 1],
+            0,
+            &args,
+        );
+    }
+
+    /// The router of the tokens `h`, their pairs' experts and weights, and
+    /// the pairs sorted by expert in tiles: the tiles at most, and whether
+    /// they are of the tensor core kernels
+    fn route(&self, s: &Scratch, m: &GpuMoe, h: &Act<'_>) -> (usize, bool) {
+        let n = h.n;
+        let c = self.cfg();
+        let mc = c.moe.as_ref().expect("a moe config");
+        let ms = s.moe.as_ref().expect("the moe buffers");
+        let (k, ne) = (mc.n_expert_used, mc.n_expert);
         let pairs = n * k;
         let mma = n > NT;
         let tile = if mma { TN } else { NT };
@@ -2359,46 +2481,7 @@ impl CudaEngine<'_> {
             (3 * ne * 4) as u32,
             &args,
         );
-
-        let tiles = max_tiles(ne, pairs, tile);
-        let ff = mc.n_ff_exp;
-        self.matmul_id(&m.gate, ms, h, k, tiles, mma, ms.a1.ptr);
-        self.matmul_id(&m.up, ms, h, k, tiles, mma, ms.a2.ptr);
-        self.elementwise(self.k.swiglu, ms.a1.ptr, ms.a2.ptr, pairs * ff);
-        let a = Act::new(ms.a1.ptr, pairs, ff, &s.q8[1]);
-        self.matmul_id(&m.down, ms, &a, 1, tiles, mma, ms.out.ptr);
-
-        let mode = match &m.shared {
-            Some(sh) => {
-                self.dense_ffn(s, &sh.gate, &sh.up, &sh.down, h, ms.shared.ptr);
-                match &sh.gate_inp {
-                    Some(g) => {
-                        self.matmul(g, h, ms.gate.ptr);
-                        1
-                    }
-                    None => 2,
-                }
-            }
-            None => 0,
-        };
-        let args = CombineArgs {
-            x: s.x.ptr,
-            out: ms.out.ptr,
-            weights: ms.weights.ptr,
-            shared: ms.shared.ptr,
-            gate: ms.gate.ptr,
-            n_embd: emb as i32,
-            k: k as i32,
-            mode,
-            pad: 0,
-        };
-        self.d.launch(
-            self.k.moe_combine,
-            [emb.div_ceil(256) as u32, n as u32, 1],
-            [256, 1, 1],
-            0,
-            &args,
-        );
+        (max_tiles(ne, pairs, tile), mma)
     }
 }
 

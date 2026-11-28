@@ -29,8 +29,9 @@
 //! e.g. a second llama.cpp run or a `--out` of an earlier run (its `.meta` has
 //! `start_row` when the positions are contiguous, i.e. not in `chunk=N` mode).
 //! The engine is the model itself, i.e. the CPU backend, or with
-//! `--metal [max_batch]` (macOS) the Metal one, of passes of `max_batch`
-//! tokens (512, more for a longer `verify=N`).
+//! `--gpu [max_batch]` the GPU one (Metal on macOS, CUDA with the `cuda`
+//! feature; `--metal` is the same), of passes of `max_batch` tokens (512,
+//! more for a longer `verify=N`).
 use std::fs;
 use std::process::exit;
 use std::time::Instant;
@@ -74,12 +75,12 @@ struct Args {
     tsv: Option<String>,
     against: Option<String>,
     all: bool,
-    /// the Metal engine, of passes of this many tokens
-    metal: Option<usize>,
+    /// the GPU engine, of passes of this many tokens
+    gpu: Option<usize>,
 }
 
 const USAGE: &str = "usage: reflogits <gguf> <ref prefix> [--mode prefill|all|token|chunk=N|verify=N] \
-                     [--warm N] [--context N] [--limit N] [--out FILE] [--tsv FILE] [--against PREFIX] [--all] [--metal [BATCH]]";
+                     [--warm N] [--context N] [--limit N] [--out FILE] [--tsv FILE] [--against PREFIX] [--all] [--gpu [BATCH]]";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("reflogits: {msg}");
@@ -100,7 +101,7 @@ fn args() -> Args {
         tsv: None,
         against: None,
         all: false,
-        metal: None,
+        gpu: None,
     };
     let num = |v: Option<String>| -> usize {
         v.and_then(|v| v.parse().ok()).unwrap_or_else(|| die(USAGE))
@@ -118,13 +119,13 @@ fn args() -> Args {
             "--tsv" => a.tsv = Some(it.next().unwrap_or_else(|| die(USAGE))),
             "--against" => a.against = Some(it.next().unwrap_or_else(|| die(USAGE))),
             "--all" => a.all = true,
-            "--metal" => {
+            "--gpu" | "--metal" => {
                 // an optional batch size
                 let batch = it.peek().and_then(|v| v.parse().ok());
                 if batch.is_some() {
                     it.next();
                 }
-                a.metal = Some(batch.unwrap_or(512));
+                a.gpu = Some(batch.unwrap_or(512));
             }
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -420,15 +421,11 @@ fn main() {
             Mode::Verify(c) => c - 1,
             _ => 0,
         };
-        let engine: Box<dyn Engine + '_> = match a.metal {
+        let engine: Box<dyn Engine + '_> = match a.gpu {
             None => Box::new(&model),
-            #[cfg(target_os = "macos")]
-            Some(batch) => Box::new(
-                biv::metal::MetalEngine::new(&model, batch.max(draft + 1))
-                    .unwrap_or_else(|e| die(e)),
-            ),
-            #[cfg(not(target_os = "macos"))]
-            Some(_) => die("--metal needs macOS"),
+            Some(batch) => biv_cli::gpu_engine(&model, batch.max(draft + 1))
+                .unwrap_or_else(|e| die(e))
+                .unwrap_or_else(|| die("no GPU backend in this build")),
         };
         let mut s = engine
             .new_session(context, draft)

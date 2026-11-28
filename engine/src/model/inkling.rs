@@ -45,7 +45,7 @@ const MAX_SLOTS: usize = 512;
 
 /// The eps of the weightless RMS norms of the depth mixes and controllers,
 /// hard-coded by llama.cpp (the file's is the same f32 in Inkling-2-Mini)
-const MIX_EPS: f32 = 1e-6;
+pub(crate) const MIX_EPS: f32 = 1e-6;
 
 /// The hyperparameters of `inkling2_loop` beyond [`Config`]'s
 #[derive(Debug, Clone)]
@@ -137,6 +137,62 @@ impl InklingConfig {
     /// feed-forward output
     pub fn conv_channels(&self, kv_dim: usize, n_embd: usize) -> usize {
         2 * kv_dim + 2 * n_embd
+    }
+}
+
+/// Where the GPU backends keep the normalized blocks of the stream, regions
+/// of a pass's rows in one buffer: the prelude's, the core's by the parity of
+/// the pass (a pass reads the previous one's as its bank of messages), the
+/// epilogue's, then the normalized stream and the previous pass's output
+#[cfg_attr(
+    not(any(all(feature = "metal", target_os = "macos"), feature = "cuda")),
+    allow(dead_code)
+)]
+#[derive(Clone, Copy)]
+pub(crate) struct StackPlan {
+    pub(crate) prelude: usize,
+    pub(crate) core: usize,
+    pub(crate) epilogue: usize,
+}
+
+#[cfg_attr(
+    not(any(all(feature = "metal", target_os = "macos"), feature = "cuda")),
+    allow(dead_code)
+)]
+impl StackPlan {
+    pub(crate) fn new(ink: &InklingConfig, n_layer: usize) -> Self {
+        let blocks = |r: core::ops::Range<usize>| r.filter(|i| i.is_multiple_of(ink.block)).count();
+        StackPlan {
+            prelude: blocks(0..ink.loop_start),
+            core: blocks(ink.loop_start..ink.loop_end),
+            epilogue: blocks(ink.loop_end..n_layer),
+        }
+    }
+
+    pub(crate) fn regions(&self) -> usize {
+        self.prelude + 2 * self.core + self.epilogue + 2
+    }
+
+    /// The normalized stream of the visit
+    pub(crate) fn cur(&self) -> usize {
+        self.regions() - 2
+    }
+
+    /// The previous pass's normalized output
+    pub(crate) fn bank_out(&self) -> usize {
+        self.regions() - 1
+    }
+
+    /// The region of the `j`-th block pushed by a visit of pass `pass` of
+    /// layer `layer`
+    pub(crate) fn push(&self, ink: &InklingConfig, layer: usize, pass: usize, j: usize) -> usize {
+        if layer < ink.loop_start {
+            j
+        } else if layer < ink.loop_end {
+            self.prelude + (pass % 2) * self.core + j
+        } else {
+            self.prelude + 2 * self.core + j
+        }
     }
 }
 
@@ -1474,6 +1530,45 @@ mod tests {
         // [T,T,T,T,T,F] x 4)
         let full: Vec<usize> = (0..48).filter(|&s| ink.layer_of(s, 24) % 6 == 5).collect();
         assert_eq!(full, [5, 11, 17, 23, 29, 35, 41, 47]);
+    }
+
+    #[test]
+    fn stack_regions_of_the_blocks_are_distinct() {
+        let ink = mini();
+        let plan = StackPlan::new(&ink, 24);
+        assert_eq!((plan.prelude, plan.core, plan.epilogue), (1, 2, 1));
+        assert_eq!(plan.regions(), 8);
+        // the blocks pushed by a pass, in visit order
+        let pushes = |pass: usize| -> Vec<usize> {
+            let mut j = 0;
+            let mut out = Vec::new();
+            for v in ink.visits(24).iter().filter(|v| v.pass == pass) {
+                if v.layer.is_multiple_of(ink.block) {
+                    let phase_start = matches!(v.layer, 0 | 6 | 18);
+                    if phase_start {
+                        j = 0;
+                    }
+                    out.push(plan.push(&ink, v.layer, v.pass, j));
+                    j += 1;
+                }
+            }
+            out
+        };
+        // the prelude's and the epilogue's (pass 0), the core's by parity
+        assert_eq!(pushes(0), [0, 1, 2, 5]);
+        assert_eq!(pushes(1), [3, 4]);
+        assert_eq!(pushes(2), [1, 2]);
+        // the stream and the bank's output after every block
+        assert_eq!((plan.cur(), plan.bank_out()), (6, 7));
+        // a pass's core blocks never overwrite the previous pass's (its bank)
+        for pass in 1..ink.loop_count {
+            let (now, before) = (pushes(pass), pushes(pass - 1));
+            let before: Vec<usize> = before
+                .into_iter()
+                .filter(|&r| (1..5).contains(&r))
+                .collect();
+            assert!(now.iter().all(|r| !before.contains(r)), "pass {pass}");
+        }
     }
 
     #[test]
